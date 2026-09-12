@@ -1,0 +1,340 @@
+template <class RNG>
+void randomParticleMotion(std::vector<Particle>& particles, uint32_t seed) {
+  RNG rng(seed);
+  for (int i = 0; i < STEPS; i++) {
+    auto sz = particles.size();
+    for (int j = 0; j + 1 < sz; j += 2) {
+      uint32_t angle1 = rng.gen();
+      float angle_rad = angle1 * DEGREE_TO_RADIAN;
+      particles[j].x += cosine(angle_rad) * particles[j].velocity;
+      particles[j].y += sine(angle_rad) * particles[j].velocity;
+
+      uint32_t angle2 = rng.gen();
+      float angle_rad2 = angle2 * DEGREE_TO_RADIAN;
+      particles[j+1].x += cosine(angle_rad2) * particles[j+1].velocity;
+      particles[j+1].y += sine(angle_rad2) * particles[j+1].velocity;
+    }
+    if (sz % 2) {
+      uint32_t angle = rng.gen();
+      float angle_rad = angle * DEGREE_TO_RADIAN;
+      particles[sz-1].x += cosine(angle_rad) * particles[sz-1].velocity;
+      particles[sz-1].y += sine(angle_rad) * particles[sz-1].velocity;
+    }
+  }
+}
+你的直觉是对的，这段代码的加速效果确实不像“大页”或“向量化”那样容易理解。它的核心原理，绕过了CPU的一个硬件瓶颈。
+
+让我们一步步拆解。
+
+---
+
+### 1. 加速的真正来源：CPU 的“保留站”（Reservation Station）
+
+现代 CPU 为了能并行执行指令，内部有一个叫**保留站**的硬件单元。你可以把它理解成一个“待办事项池”，CPU 会从这个池子里挑选那些**所有输入都已就绪**的指令，并发送到执行单元去运行。
+
+这个池子的大小是固定的（比如 Intel 的 CPU 通常有 96 个条目）。
+
+---
+
+### 2. 原始代码：池子里只有一条“链”
+
+在原始代码的每一次迭代中，你执行了以下操作：
+
+1.  `rng.gen()`：生成随机数（内部有 6 条位运算指令，且 **前后依赖**）
+2.  `angle_rad = angle * DEGREE_TO_RADIAN`：浮点乘法
+3.  `cosine(angle_rad)`：三角函数（可能消耗几十到上百个周期）
+4.  `sine(angle_rad)`：另一个三角函数
+5.  更新 `particles[j]` 的坐标
+
+其中 **`rng.gen()` 内部有一条 6 条指令长、前后依赖的链**。这意味着，CPU 必须等待这 6 条指令全部完成，才能拿到下一个粒子的随机数。
+
+这就像一条单车道隧道，每次只能过一辆车，CPU 的保留站里只有这一条“链”在前进，无法填满。
+
+---
+
+### 3. 手动展开后的代码：池子里有两条“并行链”
+
+展开后的代码是这样：
+
+```cpp
+uint32_t angle1 = rng.gen();  // 链 1
+// 计算粒子 j 的位置（链 1 的后续）
+
+uint32_t angle2 = rng.gen();  // 链 2
+// 计算粒子 j+1 的位置（链 2 的后续）
+```
+
+关键点在于：
+
+- `angle1` 的生成和计算，**与** `angle2` 的生成和计算，**两者之间没有依赖关系**。
+- 虽然 `angle2` 的生成要等 `angle1` 生成完，但 `angle2` 的计算（sin/cos）和 `angle1` 的计算（sin/cos）是独立的。
+
+**为什么这能加速？**
+
+因为现在保留站里同时有 **两条独立的依赖链**：
+
+```
+链 1: gen() → sin/cos → 写回
+链 2: gen() → sin/cos → 写回
+```
+
+CPU 可以在这两条链之间来回切换执行：
+
+1.  当链 1 在等待 `cosine` 计算时，链 2 的 `gen()` 已经生成好了，可以立即启动 `cosine`。
+2.  当链 2 在等待 `sine` 时，链 1 的 `sine` 可能已经完成，可以开始下一个粒子的计算。
+
+**两条链交错执行，填满了保留站，掩盖了 `gen()` 内部那条短依赖链的延迟。**
+
+---
+
+### 4. 用生活中的例子来类比
+
+想象你在银行柜台办业务，只有一个窗口（单链）。每个客户需要：填表（6步，必须按顺序）→ 柜员审核（sin/cos）。因为填表必须按顺序，所以第二个客户必须等第一个客户填完表才能开始填。
+
+现在你开了两个窗口（双链），但只配了一个填表区。两个客户可以**交替填表**：客户1填完第1步，轮到客户2填第1步；客户1填第2步，客户2填第2步……这样虽然填表顺序没变，但两个客户都在推进，不会有一个客户在那里干等另一个。
+
+---
+
+### 5. 为什么展开不是越多越好？
+
+如果继续展开成 4 条链呢？
+
+- 保留站会被 4 条链的中间状态占满
+- 每条链的 `gen()` 只占 6 条指令，而 `sin/cos` 可能占上百个周期
+- 4 条链需要 4 倍多的寄存器，可能超出 CPU 的物理寄存器数量，导致寄存器溢出到内存（称为“寄存器溢出”），反而变慢
+
+所以，**展开 2 条链正好**，再多反而有副作用。这个最佳值取决于 CPU 的保留站大小、执行单元数量、以及 `sin/cos` 的实现复杂程度。这就是提示 3 里提到的“尝试找到适合你机器的块大小”。
+
+---
+
+### 总结一句话
+
+> **这段代码的加速原理，不是让一条链跑得更快，而是通过增加另一条独立的链，让 CPU 的保留站（待办事项池）在两个任务之间交替工作，从而掩盖了单个任务中那些必须等待的延迟。** 这是一种更精细的、利用 CPU 并行能力的优化方式，而不是让某个函数本身变快。
+****************************************************
+The trick to improving performance in dependency chain problems (where the dependency cannot be changed) is to try
+to handle "chunks" of the chain per iteration, rather than a single node. See if you can find an optimal solution for
+your machine.
+
+
+********************************************
+**待办事项**：添加一个介绍视频和一个总结视频。
+
+这个小程序模拟随机粒子运动。我们有 1000 个粒子在二维平面上不受约束地运动。这意味着没有边界限制，它们可以任意远离初始坐标。每个粒子的初始 x 和 y 坐标在 [-1000, 1000] 范围内，速度恒定在 [0, 1] 之间。程序模拟了 1000 步粒子运动。
+
+为了验证模拟结果（粒子的最终位置），我们使用了一个确定性的（伪）随机数生成器，它依赖于一个全局状态，因此总是生成相同的随机数序列。
+
+代码中有一个非常棘手的性能问题，阻碍了模拟的高速运行。你能在代码中找到这条依赖链并修复它吗？
+
+注意：只要验证测试能够通过，你的解决方案在功能上可以不与原程序完全等价。例如，如果随机数生成器生成不同的随机数序列——那也是可以的。用户无法察觉其中的差异，因为粒子的运动本身就是随机的。
+
+## 提示
+
+<details>
+<summary><b>提示 1：</b></summary>
+
+这是一个依赖链问题。你应该首先尝试找出，为什么 `solution.hpp` 中 `randomParticleMotion` 的循环迭代不是独立的。在迭代 N 中使用的值，是否依赖于迭代 N-1 中计算的结果？
+
+</details>
+
+<br>
+
+<details>
+<summary><b>提示 2：</b></summary>
+
+查看 `XorShift32::gen()` 的实现。你注意到了这个函数的返回值有什么特点？
+
+</details>
+
+<br>
+
+<details>
+<summary><b>提示 3：</b></summary>
+
+在依赖链问题中（当依赖无法改变时），提高性能的技巧是尝试在每次迭代中处理“块”而不是单个节点。看看能否为你的机器找到一个最优的块大小。
+
+</details>
+
+<br>
+
+<details>
+<summary><b>完整解题方案：</b></summary>
+
+## 背景：
+
+本实验中的程序模拟随机粒子运动。相关代码循环位于 `solution.hpp` 中：
+
+```c++
+template <class RNG>
+void randomParticleMotion(std::vector<Particle> &particles, uint32_t seed) {
+  RNG rng(seed);
+  for (int i = 0; i < STEPS; i++)
+    for (auto &p : particles) {
+      uint32_t angle = rng.gen();
+      float angle_rad = angle * DEGREE_TO_RADIAN;
+      p.x += cosine(angle_rad) * p.velocity;
+      p.y += sine(angle_rad) * p.velocity;
+    }
+}
+```
+
+我们看到这里使用了一个随机数生成器，它可以是模板类型（`RNG`）。本实验使用以下类通过 `gen()` 函数生成下一个随机数：
+
+```c++
+struct XorShift32 {
+  uint32_t val;
+  XorShift32 (uint32_t seed) : val(seed) {}
+
+  uint32_t gen() {
+    val ^= (val << 13);
+    val ^= (val >> 17);
+    val ^= (val << 5);
+    return val;
+  }
+};
+```
+
+如果我们仔细分析 `randomParticleMotion` 中的循环，就会发现 `XorShift32` 的实现给代码引入了一条主要的依赖链。`XorShift32` 的实现**不是无状态的**；`gen()` 的返回值依赖于 `XorShift32::val` 的当前值。接着回头再看我们的循环，我们会发现未来的迭代无法被 CPU 提前执行，因为 `gen()` 的未来值在它前面的所有迭代完成之前是无法得知的。
+
+以下是原始代码的基准测试结果：
+
+```
+----------------------------------------------------------------
+Benchmark                      Time             CPU   Iterations
+----------------------------------------------------------------
+bench1/iterations:200       19.4 ms         19.4 ms          200
+```
+
+### 解题方案
+
+由于 `gen()` 的依赖链只有六条位运算指令，我们可以简单地通过手动展开循环来加速处理：
+
+```c++
+template <class RNG>
+void randomParticleMotion(std::vector<Particle>& particles, uint32_t seed) {
+  RNG rng(seed);
+  for (int i = 0; i < STEPS; i++) {
+    auto sz = particles.size();
+    for (int j = 0; j + 1 < sz; j += 2) {
+      uint32_t angle1 = rng.gen();
+      float angle_rad = angle1 * DEGREE_TO_RADIAN;
+      particles[j].x += cosine(angle_rad) * particles[j].velocity;
+      particles[j].y += sine(angle_rad) * particles[j].velocity;
+
+      uint32_t angle2 = rng.gen();
+      float angle_rad2 = angle2 * DEGREE_TO_RADIAN;
+      particles[j+1].x += cosine(angle_rad2) * particles[j+1].velocity;
+      particles[j+1].y += sine(angle_rad2) * particles[j+1].velocity;
+    }
+    if (sz % 2) {
+      uint32_t angle = rng.gen();
+      float angle_rad = angle * DEGREE_TO_RADIAN;
+      particles[sz-1].x += cosine(angle_rad) * particles[sz-1].velocity;
+      particles[sz-1].y += sine(angle_rad) * particles[sz-1].velocity;
+    }
+  }
+}
+```
+
+### 进阶解法
+
+在上面的解法中，我们之所以能手动展开循环，是因为依赖链相对较小。原始的 `XorShift32::gen()` 依赖链只有六条指令长（几个位运算操作）。但在依赖链更长的情况下，我们就无法通过展开循环来获得同样收益了，因为总指令数会超过 CPU 物理上能够“看到”的未来指令数量（在其**保留站**中）。
+
+在这种情况下，我们需要改写 `XorShift32`，在 `gen()` 中**交错（interleaving）**多条依赖链。
+
+逻辑如下：
+
+假设我们决定生成两条依赖链。在这种场景下，我们将一次性生成**两个**随机数。我们实质上把 `gen()` 中的每一行代码都复制一份用于第二个随机数。然而，这些行必须**交错（interleaved）**：
+
+```c++
+int val1 = 0, int val2 = 0;
+...
+
+// 错误 - 所有对 `val1` 的操作都在 `val2` 之前
+val1 = doSomething(val1);
+val1 = doSomethingElse(val1);
+val2 = doSomething(val2);
+val2 = doSomethingElse(val2);
+...
+
+// 正确 - 对 `val1` 和 `val2` 的操作是交错的
+val1 = doSomething(val1);
+val2 = doSomething(val2);
+val1 = doSomethingElse(val1);
+val2 = doSomethingElse(val2);
+```
+
+经过此修改后，我们的随机数生成器可能如下所示：
+
+```c++
+/// 轻量级 Pair 类 - std::pair 的开销在这里是不必要的
+template<typename First, typename Second>
+struct Pair {
+  First first;
+  Second second;
+};
+
+struct XorShift32 {
+  Pair<uint32_t, uint32_t> val;
+  XorShift32 (uint32_t seed) {
+      val.first = seed;
+      uint32_t second = val.first;
+      second ^= (second << 13);
+      second ^= (second >> 17);
+      second ^= (second << 5);
+      val.second = second;
+  }
+
+  auto gen() {
+    val.first ^= (val.first << 13);
+    val.second ^= (val.second << 13);
+
+    val.first ^= (val.first >> 17);
+    val.second ^= (val.second >> 17);
+
+    val.first ^= (val.first << 5);
+    val.second ^= (val.second << 5);
+    return val;
+  }
+};
+```
+
+我们可以将 `randomParticleMotion` 中的循环改写为：
+
+```c++
+template <class RNG>
+void randomParticleMotion(std::vector<Particle>& particles, uint32_t seed) {
+  RNG rng(seed);
+  for (int i = 0; i < STEPS; i++) {
+    auto sz = particles.size();
+    for (int j = 0; j + 1 < sz; j += 2) {
+      Pair<uint32_t, uint32_t> angle = rng.gen();
+      float angle_rad = angle.first * DEGREE_TO_RADIAN;
+      particles[j].x += cosine(angle_rad) * particles[j].velocity;
+      particles[j].y += sine(angle_rad) * particles[j].velocity;
+
+      float angle_rad2 = angle.second * DEGREE_TO_RADIAN;
+      particles[j+1].x += cosine(angle_rad2) * particles[j+1].velocity;
+      particles[j+1].y += sine(angle_rad2) * particles[j+1].velocity;
+    }
+    if (sz % 2) {
+      Pair<uint32_t, uint32_t> angle = rng.gen();
+      float angle_rad = angle.first * DEGREE_TO_RADIAN;
+      particles[sz-1].x += cosine(angle_rad) * particles[sz-1].velocity;
+      particles[sz-1].y += sine(angle_rad) * particles[sz-1].velocity;
+    }
+  }
+}
+```
+
+在这种情况下，这种方法并没有带来太大的性能提升，但这符合预期，因为 `rng.gen()` 的依赖链本身非常短。然而，在大多数受依赖链影响的代码中，依赖链通常不会如此微不足道，因此在大多数实际场景中，掌握这种进阶技术是必要的！
+
+</details>
+
+<br>
+
+<details>
+<summary><b>解决方案代码链接：</b></summary>
+
+[链接至解决方案](https://github.com/dendibakh/perf-ninja/blob/golden/labs/core_bound/dep_chains_2/solution.cpp)
+
+</details>

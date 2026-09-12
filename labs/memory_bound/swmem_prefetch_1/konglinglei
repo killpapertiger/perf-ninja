@@ -1,0 +1,12 @@
+为什么插入操作不能预取？而查找可以？因为我们提前知道lookups数组
+**********************************************************
+Velox的自适应预取
+# hashRows 自适应预取
+
+归一化键模式下计算哈希时，hashRows 会读取每行指针前置存储的归一化键。数据行从行容器内存池分配，且按哈希分区顺序访问，连续行指针通常对应不同缓存行。若数据量超出CPU末级缓存，每次读取归一化键都会触发内存访问。
+
+When computing hashes in kNormalizedKey mode, `hashRows` reads the normalized key stored immediately before each row pointer. Because rows are allocated from a RowContainer arena and accessed in hash-partitioned order, successive row pointers typically reference different cache lines. When the working set exceeds the CPU’s last-level cache, each normalized key read incurs a DRAM access.
+
+为掩盖访问延迟，hashRows 启用自适应预取机制。前16轮迭代中，以预取步长4测算单次迭代耗时。测算完成后，依据预估内存延迟与实测迭代耗时的比值，乘以系数4算出最优预取步长。最终步长限定在4~32区间，步长超32会因过量预取挤占一级缓存资源。
+
+To hide this latency, `hashRows` uses the `AdaptivePrefetch` class. During the first 16 iterations, the class measures per-iteration time using a conservative look-ahead of 4. After measurement, it computes an optimal look-ahead distance based on the ratio of assumed DRAM latency to measured iteration time, multiplied by a coefficient of 4. The result is clamped to [4, 32] — values above 32 risk polluting L1 cache with too many outstanding prefetches.

@@ -12,3 +12,7 @@ using result_t = std::array<int16_t, sequence_count_v>;
 
 result_t compute_alignment(std::vector<sequence_t> const &, std::vector<sequence_t> const &);
 std::pair<std::vector<sequence_t>, std::vector<sequence_t>> init();
+
+
+
+

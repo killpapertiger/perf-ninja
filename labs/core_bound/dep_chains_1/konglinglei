@@ -1,0 +1,3 @@
+在空间上分散：M 个 vals 和 M 个 l2->value 的比较，让 CPU 的多个执行单元可以同时工作，而不是单线程地等待一个指针。
+
+这就是注释里说的 “overlap the execution of multiple dependency chains”（重叠执行多条依赖链）。

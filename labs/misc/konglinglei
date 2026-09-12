@@ -1,0 +1,455 @@
+内容来源：
+https://easyperf.net/blog/2019/11/22/data-driven-tuning-specialize-switch
+
+Data-Driven tuning. Specialize switch with one hot case.
+Categories: tuning
+22 Nov 2019
+Subscribe to my newsletter, support me on Patreon or by PayPal donation.
+
+This is the first post of the series showing how one can tune the software by introspecting the data on which it operates on and optimize the code accordingly. My intention is just to show one of the many possible ways to speed up execution.
+
+Suppose we have a hot switch inside the loop like that:
+
+  for(;;) {
+    switch(instruction) {
+      // handle different instructions
+    }
+  }
+If you know that one instruction executes much more frequently than the others (say 90% of the time) you might want to specialize the code with the most frequent case without entering the switch statement:
+
+  for(;;) {
+    if (instruction == ADD) {
+      // handle ADD
+    } else {
+      switch(instruction) {
+        // handle other instructions
+      }
+    }
+  }
+UPD: user Giuseppe Ottaviano @ot_y on twitter mentioned that the same result can be achieved by using __builtin_expect which is more readable than hand-written version (godbolt.org/z/QDeGJX):
+
+  for(;;) {
+    switch(__builtin_expect(instruction, ADD)) {
+      // handle different instructions
+    }
+  }
+Important thing to consider: this transformation only makes sense when you know you always have big percentage of ADD instructions handled. If there would be other workloads where you will have small amount of such instructions, you will pessimize them. Because now you will do one additional check for every loop iteration. Do it only in case you are really sure that your specialized case will get big number of hits.
+
+Also check if compiler with PGO will do this transformation for you. Compilers have integrated cost models to choose where this would be profitable based on profile summary. They may decide not to specialize the switch like I showed.
+
+Why it is faster? Let’s look at the hot path for both cases:
+
+original case:
+
+8.93  : ┌┬─>4008b0: add    rdi,0x1                       <== go to next symbol
+0.52  : ││  4008b4: cmp    BYTE PTR [rdi-0x1],0x10       <== go to default case?
+6.54  : │└──4008b8: ja     4008b0 
+3.99  : │   4008ba: movzx  eax,BYTE PTR [rdi-0x1]        <== indirect jump through
+9.27  : │┌──4008be: jmp    QWORD PTR [rax*8+0x401320]        the index in the table
+     ...││
+29.52 : │   400970: addsd  xmm0,QWORD PTR [rip+0xb90]    <== our hot case
+14.38 : └───400978: jmp    4008b0 
+specialized case:
+
+0.05  : ┌──>400a20: add    rdi,0x1                       <== go to next symbol
+0.03  : │   400a24: movzx  eax,BYTE PTR [rdi]
+4.83  : │   400a27: cmp    al,0x4                        <== go to hot case?
+0.00  : │┌──400a29: je     400a50
+    ... ││
+17.05 : │└─>400a50: addsd  xmm0,QWORD PTR [rip+0xab0]    <== our hot case
+33.73 : └───400a58: jmp    400a20 
+Important thing to consider: Here the extreme case is shown, where this transformation shines the most. Improvement will certainly drop with the amount of code you add to process each instruction.
+
+Code example and scripts to build the benchmark can be downloaded from my github.
+
+Timings on Intel Xeon E5-2643 v4 + gcc 4.8.5 (sec):
+
+original case:    2.06
+specialized case: 1.62
+Easy to see, in original case we execute 3 branches per iteration and only 2 in specialized case. This also can be confirmed by looking at the stats.
+
+original case:
+
+ 7609558798  cycles         #    3,677 GHz
+ 7024246955  instructions   #    0,92  insn per cycle
+ 3004688046  branches       # 1451,950 M/sec
+  152842733  branch-misses  #    5,09% of all branches
+specialized case:
+
+ 5988420359  cycles         #    3,674 GHz
+ 6300888185  instructions   #    1,05  insn per cycle
+ 2185973475  branches       # 1341,303 M/sec
+  183306832  branch-misses  #    8,39% of all branches
+I played with the benchmark and tried different amount of ADD instructions in the workload. Results are in the chart below.
+
+
+
+You can see that speedup ends after we go below 70% of ADD instructions in the workload.
+
+How to know which case gets what amount of hits? You can manually instrument the code by inserting printf statements and parse the output. That’s a naive approach. More sophisticated method of getting this data that requires no source code changes is described here.
+
+See computed goto blog post for more ideas how hot switch can be improved.
+
+And of course, do not apply any transformation blindly, always measure first.
+
+
+
+
+## 为什么 specialized case 更快？
+
+从你贴出的两段汇编来看，加速的核心原因在于：**specialized case 把原本通过间接跳转表（jump table）的多路分支，展开成了一串直接的条件判断（cmp + je），从而消除了间接跳转带来的开销。**
+
+我们来逐层拆解。
+
+---
+
+### 1. 原始版本的性能瓶颈：间接跳转
+
+在原始版本中，核心路径是这样的：
+
+```asm
+8.93  :  add    rdi,0x1                ; 指向下一个字符
+0.52  :  cmp    BYTE PTR [rdi-0x1],0x10
+6.54  :  ja     4008b0                 ; 如果 > 0x10，跳回循环开头
+3.99  :  movzx  eax,BYTE PTR [rdi-0x1]
+9.27  :  jmp    QWORD PTR [rax*8+0x401320]  ; 间接跳转！通过跳转表跳转
+29.52 :  addsd  xmm0,QWORD PTR [rip+0xb90]  ; 热路径（加法）
+14.38 :  jmp    4008b0
+```
+
+这里的关键指令是 `jmp QWORD PTR [rax*8+0x401320]`，这是一个**间接跳转（indirect jump）**。
+
+**为什么间接跳转慢？**
+
+| 原因 | 说明 |
+|------|------|
+| **分支预测困难** | 目标地址存储在内存中，CPU 无法像普通条件跳转那样轻易预测目标 |
+| **数据依赖** | 必须先加载 `[rax*8+0x401320]` 的值，才能知道跳到哪里，这引入了内存访问延迟 |
+| **可能破坏指令预取** | 跳转目标不确定，CPU 的指令预取器（prefetcher）难以提前加载正确的指令 |
+| **无法与后续指令重叠** | 在目标地址确定之前，后续指令无法进入流水线 |
+
+在原始版本中，这条间接跳转指令本身只占了 `9.27%` 的开销，但它导致的**流水线停顿（pipeline stall）**才是真正的问题所在。你看到的 `29.52%` 的热路径 `addsd` 还得等前面的间接跳转完成才能执行，这也放大了它的影响。
+
+---
+
+### 2. specialized case 的优化：直接条件跳转
+
+在 specialized case 中：
+
+```asm
+0.05  :  add    rdi,0x1                ; 指向下一个字符
+0.03  :  movzx  eax,BYTE PTR [rdi]
+4.83  :  cmp    al,0x4                 ; 比较是否为热路径符号
+0.00  :  je     400a50                 ; 如果是，跳转到热路径
+...
+17.05 :  addsd  xmm0,QWORD PTR [rip+0xab0]  ; 热路径（加法）
+33.73 :  jmp    400a20
+```
+
+这里 `je 400a50` 是一个**直接条件跳转（conditional jump）**。
+
+**为什么直接跳转快？**
+
+| 原因 | 说明 |
+|------|------|
+| **分支预测简单** | CPU 可以记录这个分支的历史，预测它是“跳转”还是“不跳转”，准确率很高 |
+| **目标地址已知** | 跳转目标编码在指令中，不需要额外加载内存 |
+| **流水线友好** | CPU 可以提前预取目标地址的指令，保持流水线饱满 |
+| **无内存访问延迟** | 不需要访问跳转表 |
+
+关键点是，相比间接跳转那 3 条指令（`movzx` + `jmp` + 内存访问），直接分支只需要 `cmp` + `je`，少了访存和间接寻址的开销。而且 `je` 的分支预测能力更强，错误惩罚更低，这也让热路径上的 `addsd` 能更快拿到控制权。
+
+---
+
+### 3. 对比表格
+
+| 特性 | 原始版本（间接跳转表） | specialized case（直接分支） |
+|------|------------------------|----------------------------|
+| 跳转方式 | `jmp QWORD PTR [rax*8+...]` | `cmp` + `je` |
+| 是否需要访存 | ✅ 需要（加载目标地址） | ❌ 不需要 |
+| 分支预测难度 | 高（目标不定） | 低（二路分支） |
+| 预取友好性 | 差 | 好 |
+| 流水线效率 | 低 | 高 |
+| 适用场景 | 分支多且分散 | 分支少，或热路径明确 |
+
+---
+
+### 4. 为什么优化效果会“随着处理代码量增加而下降”？
+
+你贴的原文最后一句很重要：
+
+> Improvement will certainly drop with the amount of code you add to process each instruction.
+
+随着你为每个指令（语法符号）添加的处理逻辑越来越复杂，热路径 `addsd` 所占的比例会越来越高，分支开销的相对占比会被稀释。
+
+举个例子：
+
+- **当前场景**：`addsd` 占了约 29.52%（原始）vs 17.05%（优化），分支优化带来的提升明显。
+- **如果热路径变成 100 条指令**：分支开销从 10% 降到 5%，对整体性能的影响可能只有 5%。此时优化分支的收益会被大量计算指令淹没，不值得单独优化。
+
+---
+
+### ✅ 一句话总结
+
+> **specialized case 更快，是因为它把“查表+间接跳转”替换为“直接比较+条件跳转”，减少了内存访问和分支预测失败，让 CPU 流水线更顺畅。** 这就是编译器在 Profile Guided Optimization（PGO）或手工优化中，对“热路径明确”的场景做分支展开（branch specialization）或跳转表剥离时能带来的收益。
+
+
+
+
+*******
+## 一句话解释
+
+- **直接跳转（Direct Jump）**：跳转的目标地址**直接写在指令里**，CPU 执行时就知道要去哪。
+- **间接跳转（Indirect Jump）**：跳转的目标地址**存放在寄存器或内存里**，CPU 必须先读取这个地址，才知道要去哪。
+
+---
+
+## 用生活中的例子类比
+
+### 直接跳转 = 你直接说出目的地
+
+> “师傅，去北京西站。”
+
+司机一听就知道目的地，直接出发。不需要查地图、不需要问路。
+
+对应到 CPU：
+- 指令里写的是 `je 400a50`（跳转到地址 `0x400a50`）
+- CPU 解码时就看到目标地址，直接去取那里的指令
+- 流水线不会中断
+
+---
+
+### 间接跳转 = 说“按导航走”
+
+> “师傅，按导航走。”
+
+司机必须先启动导航，查一下当前要去哪，然后才知道目的地。这个“查导航”的过程就是**额外的内存访问**。
+
+对应到 CPU：
+- 指令里写的是 `jmp QWORD PTR [rax*8 + 0x401320]`
+- CPU 需要先计算 `rax*8 + 0x401320` 这个地址
+- 然后去内存里读取这个地址上存的值
+- 拿到值之后，才知道真正的目标地址是什么
+- 最后才跳过去
+
+这比直接跳转多了至少**一次内存访问**，而且这个内存访问是**依赖上一条指令的结果**的，会导致流水线停顿。
+
+---
+
+## 在汇编里怎么区分
+
+### 直接跳转
+
+```asm
+je     400a50          ; 跳转目标 400a50 是常量
+jmp    4008b0          ; 跳转目标 4008b0 是常量
+```
+
+目标地址是**直接编码在指令中的**。
+
+### 间接跳转
+
+```asm
+jmp    QWORD PTR [rax*8 + 0x401320]   ; 目标在内存里
+jmp    rbx                            ; 目标在寄存器里
+call   [rax]                          ; 通过函数指针调用
+```
+
+目标地址是**动态计算出来的**，需要额外读取。
+
+---
+
+## C++ 代码中的对应关系
+
+| C++ 写法 | 生成的典型汇编 | 跳转类型 |
+|----------|---------------|----------|
+| `if (x == 1) { ... }` | `cmp` + `je target` | **直接跳转** |
+| `switch (x) { case 1: ... }`（分支多时） | `jmp [rax*8 + table]` | **间接跳转** |
+| `void (*f)(); f();` 函数指针调用 | `call [rax]` | **间接跳转** |
+| 虚函数调用 `obj->virtualFunc()` | `call [rax+offset]` | **间接跳转** |
+
+---
+
+## 为什么间接跳转慢？
+
+1. **多一次内存访问**：要先读跳转表/函数指针，才知道跳去哪
+2. **数据依赖**：目标地址依赖前面的计算结果，形成流水线阻塞
+3. **分支预测困难**：CPU 很难预测一个动态地址，预取效率低
+
+这就是为什么在热路径上，把间接跳转改造成直接跳转（如你看到的 `switch` 拆成 `if`）能带来性能提升。
+***********************
+## 一句话解释
+
+- **直接跳转（Direct Jump）**：跳转的目标地址**直接写在指令里**，CPU 执行时就知道要去哪。
+- **间接跳转（Indirect Jump）**：跳转的目标地址**存放在寄存器或内存里**，CPU 必须先读取这个地址，才知道要去哪。
+
+---
+
+## 用生活中的例子类比
+
+### 直接跳转 = 你直接说出目的地
+
+> “师傅，去北京西站。”
+
+司机一听就知道目的地，直接出发。不需要查地图、不需要问路。
+
+对应到 CPU：
+- 指令里写的是 `je 400a50`（跳转到地址 `0x400a50`）
+- CPU 解码时就看到目标地址，直接去取那里的指令
+- 流水线不会中断
+
+---
+
+### 间接跳转 = 说“按导航走”
+
+> “师傅，按导航走。”
+
+司机必须先启动导航，查一下当前要去哪，然后才知道目的地。这个“查导航”的过程就是**额外的内存访问**。
+
+对应到 CPU：
+- 指令里写的是 `jmp QWORD PTR [rax*8 + 0x401320]`
+- CPU 需要先计算 `rax*8 + 0x401320` 这个地址
+- 然后去内存里读取这个地址上存的值
+- 拿到值之后，才知道真正的目标地址是什么
+- 最后才跳过去
+
+这比直接跳转多了至少**一次内存访问**，而且这个内存访问是**依赖上一条指令的结果**的，会导致流水线停顿。
+
+---
+
+## 在汇编里怎么区分
+
+### 直接跳转
+
+```asm
+je     400a50          ; 跳转目标 400a50 是常量
+jmp    4008b0          ; 跳转目标 4008b0 是常量
+```
+
+目标地址是**直接编码在指令中的**。
+
+### 间接跳转
+
+```asm
+jmp    QWORD PTR [rax*8 + 0x401320]   ; 目标在内存里
+jmp    rbx                            ; 目标在寄存器里
+call   [rax]                          ; 通过函数指针调用
+```
+
+目标地址是**动态计算出来的**，需要额外读取。
+
+---
+
+## C++ 代码中的对应关系
+
+| C++ 写法 | 生成的典型汇编 | 跳转类型 |
+|----------|---------------|----------|
+| `if (x == 1) { ... }` | `cmp` + `je target` | **直接跳转** |
+| `switch (x) { case 1: ... }`（分支多时） | `jmp [rax*8 + table]` | **间接跳转** |
+| `void (*f)(); f();` 函数指针调用 | `call [rax]` | **间接跳转** |
+| 虚函数调用 `obj->virtualFunc()` | `call [rax+offset]` | **间接跳转** |
+
+---
+
+## 为什么间接跳转慢？
+
+1. **多一次内存访问**：要先读跳转表/函数指针，才知道跳去哪
+2. **数据依赖**：目标地址依赖前面的计算结果，形成流水线阻塞
+3. **分支预测困难**：CPU 很难预测一个动态地址，预取效率低
+
+这就是为什么在热路径上，把间接跳转改造成直接跳转（如你看到的 `switch` 拆成 `if`）能带来性能提升。
+************************************
+"switch (x) { case 1: ... }（分支多时）	jmp [rax*8 + table]	间接跳转" ,对于switch ，汇编是有个table？
+
+**是的，对于分支很多的 `switch`，编译器经常会生成一个“跳转表”（Jump Table）**。你看到的 `jmp QWORD PTR [rax*8 + 0x401320]` 就是在访问这个跳转表。
+
+我们先来看看这张表长什么样，然后再解释为什么编译器会选择生成它。
+
+---
+
+### 1. “跳转表”在内存里长什么样？
+
+假设你有这样一个 `switch`：
+
+```c
+switch (x) {
+    case 0: handle_0(); break;
+    case 1: handle_1(); break;
+    case 2: handle_2(); break;
+    case 3: handle_3(); break;
+}
+```
+
+编译器会生成一张表，存放在可执行文件的只读数据段（`.rodata`）里。这张表里按顺序存放着每个 `case` 对应的代码地址：
+
+```
+地址 0x401320:  0x400a00   // case 0 的代码地址
+地址 0x401328:  0x400b10   // case 1 的代码地址
+地址 0x401330:  0x400c20   // case 2 的代码地址
+地址 0x401338:  0x400d30   // case 3 的代码地址
+```
+
+在你的汇编里，`0x401320` 就是这张表的起始地址。`rax` 就是 `x` 的值。
+
+`jmp QWORD PTR [rax*8 + 0x401320]` 的意思就是：
+
+1. 用 `rax` 作为索引
+2. 跳到 `0x401320` 起始、每个条目占 8 字节的数组里去，找到对应的地址
+3. 然后跳转到那个地址
+
+---
+
+### 2. 为什么编译器会选“跳转表”而不是“if-else链”？
+
+编译器会根据 `switch` 的**分支数量**和**值的密集程度**来做决定：
+
+| 情况 | 编译器生成什么 | 原因 |
+|------|---------------|------|
+| 分支很少（2-3个） | 一串 `cmp` + `je` | 开销小，直接比较最快 |
+| 分支很多，但值稀疏（如 1, 100, 1000） | 可能生成二分查找或`if-else`链 | 跳转表太浪费内存 |
+| 分支很多，且值密集（如 0,1,2,3,4,5,6,7） | **跳转表（Jump Table）** | **O(1) 分发，不管多少个分支，都是一次查表+一次跳转** |
+
+当你看到 `jmp [rax*8 + table]` 时，就说明编译器觉得 **“分支太多了，用 if-else 链太慢，用跳转表更划算”**。
+
+---
+
+### 3. 跳转表的优点和缺点
+
+| 优点 | 缺点 |
+|------|------|
+| 分发时间恒定 O(1)，不随分支数量增长 | 如果 case 值稀疏，会浪费大量内存 |
+| 代码体积小，只有一条跳转指令 | **间接跳转，CPU 难以预测，可能破坏流水线** |
+| 实现简单 | 对热路径来说，间接跳转是致命的 |
+
+
+### 4. 这就回到你原始问题——为什么 `switch` 优化能加速
+
+在原始版本里：
+
+- `switch` 分支很多 → 编译器选择跳转表
+- CPU 每次都要做一次**间接跳转**（`jmp [rax*8 + table]`）
+- 这个跳转**依赖内存访问**、**目标不可预测**，破坏了流水线
+
+在优化版本里：
+
+- 你把最热的 `case ADD` 提前用 `if (instruction == ADD)` 截断了
+- 热路径走的是 **`je`（直接条件跳转）**，目标地址是常量
+- 其他冷分支仍然走 `switch`，但冷分支本身不频繁，开销影响不大
+
+---
+
+### 5. 冷知识：`switch` 还有另一种实现——`__builtin_expect`
+
+如果你用的是 Clang 或 GCC，可以用 `__builtin_expect` 告诉编译器哪个分支更热：
+
+```c
+switch (__builtin_expect(instruction, ADD)) {
+    case ADD: /* ... */ break;
+    case SUB: /* ... */ break;
+    // ...
+}
+```
+
+这样编译器在生成跳转表时，可以把 `ADD` 的地址放在特别位置，或者直接把它移出跳转表变成一个独立的 `if`。这和手工写 `if (instruction == ADD)` 的效果类似，但代码更干净。
+
+*********************************************************

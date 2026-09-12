@@ -1,0 +1,229 @@
+Sequence alignment methods include dynamic programming algorithms like Needleman-Wunsch (global) and Smith-Waterman (local) that provide optimal but slow results, fast heuristic methods like BLAST and FASTA for database searching, progressive approaches like ClustalW for multiple sequences, and specialized techniques including dot-matrix visualization, structural alignment using 3D protein information, and profile-based methods with hidden Markov models. source
+
+Global alignment method such as Needleman-Wunsch should be a good one to learn from scratch with dynamic programming. This youtube tutorial by Professor Hendrix is very helpful in creating scoring matrix, traceback matrix and optimal alignment.
+
+原始代码完整思路解析（Smith–Waterman 局部序列比对 + 单列内存优化版本）
+
+# 一、模型说明
+算法：**带仿射空位罚分的 Needleman–Wunsch 全局序列比对**
+两条序列：
+$A[0\dots N-1],\;N=200$（sequence1）
+$B[0\dots M-1],\;M=200$（sequence2）
+
+定义三组DP状态（标准二维形式）
+1. $\(H[r,c]\)$：位置 $\((r,c)\)$，**A[r-1] 与 B[c-1] 碱基对齐**（不在空位上）
+2. $\(V[r,c]\)$：位置 $\((r,c)\)$，**B 上空位（垂直空位）**，A取碱基、B插入空位
+3. $\(G[r,c]\)$：位置 $\((r,c)\)$，**A 上空位（水平空位）**，B取碱基、A插入空位
+
+打分参数：
+$$
+\begin{align*}
+match &= 6 \\
+mismatch &= -4 \\
+gap_{open} &= -11 \\
+gap_{extension} &= -1
+\end{align*}
+$$
+字符得分函数：
+$$
+s(a,b)=
+\begin{cases}
+match & a=b \\
+mismatch & a\ne b
+\end{cases}
+$$
+
+# 二、核心递推公式
+$$
+\boldsymbol{\(H[r,c]\) = H[r-1,c-1] + s(A[r-1],B[c-1])}
+$$
+
+$$
+\boldsymbol{\(V[r,c]\) = \max\big(\; H[r-1,c] + gap_{open},\; V[r-1,c] + gap_{extension}\;\big)}
+$$
+
+$$
+\boldsymbol{\(G[r,c]\) = \max\big(\; H[r,c-1] + gap_{open},\; G[r,c-1] + gap_{extension}\;\big)}
+$$
+
+最终当前位置最优候选：
+$$
+best\((r,c)\) = \max\big(\;\(H[r,c]\),\;\(V[r,c]\),\;\(G[r,c]\)\;\big)
+$$
+
+> 语义解释：
+> - $V$：从上一行下来；要么**新开空位**，要么**延续上方已经存在的空位**
+> - $G$：从左边一列过来；要么**新开空位**，要么**延续左侧已经存在的空位**
+
+# 三、边界条件（原始代码初始化对应的边界）
+$\(\(r=0\),\(c=0\)\)$：
+$$
+\(H[0,0]=0\)
+$$
+
+1. 第0列 $\(c=0\)$（B全部为空）
+$$
+\begin{align*}
+H[r,0] &= -\infty \\
+V[r,0] &= \max\big(H[r-1,0]+gap_{open},\; V[r-1,0]+gap_{extension}\big) \\
+G[r,0] &= -\infty
+\end{align*}
+$$
+
+2. 第0行 $\(r=0\)$（A全部为空）
+$$
+\begin{align*}
+H[0,c] &= -\infty \\
+V[0,c] &= -\infty \\
+G[0,c] &= \max\big(H[0,c-1]+gap_{open},\; G[0,c-1]+gap_{extension}\big)
+\end{align*}
+$$
+
+最终答案：$\boldsymbol{\(\boldsymbol{H[N,M]}\)}$（DP矩阵右下角）
+
+# 四、原始代码「单列滚动优化」如何映射公式
+原始代码**不存储整张二维表，只保存上一列 $c-1$ 的状态**：
+- `score_column[r]`  ↔ $H[r,c-1]$
+- `horizontal_gap_column[r]` ↔ $G[r,c-1]$
+- `last_vertical_gap` 滚动保存本行的 $\(V[r,c]\)$
+
+遍历顺序：外层循环 $c$（B字符），内层循环自上而下 $r$（A字符）。
+对于当前新列 $c$：
+```
+// 1) 对角线来源 H[r-1,c-1]
+candidate = last_diagonal_score + s(A[r-1],B[c-1])
+
+// best_cell_score = max(H候选, \(V[r,c]\), \(G[r,c]\))
+best_cell_score = max(candidate, last_vertical_gap);
+best_cell_score = max(best_cell_score, horizontal_gap_column[r]);
+
+// best_cell_score 就是新的 \(H[r,c]\)
+
+// 更新空位状态：
+new_gap_start = \(H[r,c]\) + gap_open;
+\(V[r,c]\) = max( V[r-1,c]+gap_extension, new_gap_start )
+\(G[r,c]\) = max( G[r,c-1]+gap_extension, new_gap_start )
+```
+对应代码片段：
+```cpp
+// \(V[r,c]\) ← last_vertical_gap
+last_vertical_gap += gap_extension;
+last_vertical_gap = max(last_vertical_gap, best_cell_score + gap_open);
+
+// \(G[r,c]\) ← horizontal_gap_column[r]
+horizontal_gap_column[row] += gap_extension;
+horizontal_gap_column[row] = max(horizontal_gap_column[row], best_cell_score + gap_open);
+```
+
+# 五、关键结论
+原始C++代码的计算逻辑，**严格等价于上面三组DP递推公式**；
+只是通过「只保留上一列状态」做空间压缩，数学递推关系没有任何改变。
+
+如果你需要，我可以把代码中每一行运算，逐行标注对应的 $\(H/V/G\)$ 公式项。
+
+
+
+*****************************
+我觉得这个问题难在不是编程，难在没有这道题涉及的 Needleman-Wunsch DP
+你说到了最核心的真相：
+**阻碍你的根本不是 C++、不是 SIMD、不是矩阵转置，是你事先不熟悉 Needleman–Wunsch + 仿射空位 DP 这套生物信息比对模型。**
+
+我帮你把难点分层拆开，你就能看清卡在哪一环：
+## 层次1：领域算法（门槛，外部知识）
+Needleman-Wunsch 全局比对 + 仿射空位罚分（H/V/G三状态DP）
+- 普通刷题 DP：一维/二维背包、最短路，状态含义直观；
+- 这个DP：三个耦合状态、边界条件诡异、滚动数组压缩后进一步扭曲代码形态。
+很多计算机专业学生也从没接触，这是**生物信息学专用算法**，不属于通用算法题库内容。
+
+后果：
+你在读 `main` 里的基准代码时，
+你要同时负担两件难事：
+1. 一边理解「H/V/G三个状态到底在算什么」
+2. 一边理解「滚动单列优化如何等价原始二维DP」
+
+两层新概念压在一起，人脑负载直接拉满。
+如果你从来没见过序列比对DP，看代码天然觉得晦涩、变量含义莫名其妙。
+
+## 层次2：工程变形（在算法基础之上）
+在弄懂DP之后，才轮到工程难题：
+1. 原始布局 `[seq][pos]` 访存不适合SIMD；
+2. 需要转置为 `[pos][seq]`；
+3. 所有标量状态拓宽为长度16的数组，实现16组DP并行推进；
+4. 调整循环结构，迎合GCC自动向量化规则（拆循环不能合并）。
+
+> 客观顺序：
+**懂NW仿射空位DP → 看懂标量滚动版本 → 理解访存瓶颈 → 转置+拓宽状态实现SIMD**
+一旦第一层缺基础，后面所有优化步骤如同空中楼阁。
+
+## 非常关键的一点区分
+### 两种困难完全不一样：
+1. **不会写代码**：语法、STL、指针、内存管理不熟练；
+2. **看不懂业务DP模型**：不知道这个DP要解决什么问题，状态定义、边界、递推来源无法建立直观理解。
+
+你属于第二种。
+**这不代表你不擅长C++性能优化，只是缺少一个小众领域的前置算法知识。**
+
+举个类比：
+一个很强的C++后端工程师，如果从来没接触过运动补偿、H.264，直接丢给他一段视频编码SIMD优化代码，一样会一头雾水。
+不是C++能力不行，是领域专用算法没有前置积累。
+
+## 给你一条低压力的学习路径，避开自我怀疑
+### 第一步：先剥离C++，纯纸上吃透算法（脱离代码）
+1. 忘掉所有代码、滚动数组、SIMD。
+2. 在纸上写出标准二维 H/V/G 递推式，搞懂：
+   - H：碱基对齐；
+   - V：垂直空位；
+   - G：水平空位；
+   - 仿射空位为什么必须三个状态（单一数组无法区分“新开空位 / 延续空位”）；
+3. 手动算极小例子：两条长度3的短序列，手填DP表格，验证最终右下角得分。
+
+只要能手推表格，算法层面的障碍就清除了。
+
+### 第二步：回到代码，看懂「滚动单列压缩」
+明白：为什么不需要存储整张201×201表格，只保留一列。
+这时你再看main里面基准实现，每一行运算就能和纸上公式一一对应（我们之前做过逐行映射）。
+
+### 第三步：最后再研究 SIMD、矩阵转置优化
+等算法不再是障碍，剩下的就只是一套**固定HPC重构套路**：
+批量独立任务 → 调整数据布局改善局部性 → 标量状态拓宽为向量 → 改造循环适配自动向量化。
+这套套路是通用的，学会以后可以迁移到别的算法。
+
+## 回应你刚才心里的疑问：要不要放弃C++深度优化？
+不要因为**一道绑定特定领域DP的练习题**下结论。
+这道题是「领域专用算法 + 性能优化」的复合题。
+现实工作里大概率不会让你从零实现NW比对+SIMD；
+绝大多数C++高性能岗位，算法是给定的，你的工作重心是：
+缓存优化、减少分配、并发、热点剖析、SIMD改造已有逻辑。
+
+> 最坏情况：就算你永远不精通序列比对DP，只要掌握「数据布局变换、循环变换、自动向量化套路」，依旧胜任ClickHouse、HPC、量化基础设施开发。
+
+如果你愿意，我们可以先抛开所有C++代码，先用最简单的例子，手推一遍小型Needleman-Wunsch仿射空位DP表格，先把最底层算法打通。
+
+
+**********************************
+通俗概括：
+不是把算法内部的循环向量化，而是「一次性并行跑 16 个独立的 Gotoh 比对任务」。
+⚠️ 非常关键区分：
+❌ 不可能把单个序列比对内部的 DP 循环（row/col 嵌套）直接向量化
+DP 存在强数据依赖：算 H[r][c] 必须先算出左上、上方、左边的值，时序依赖无法打碎并行；
+✅ 可行的是：同时并行处理 16 对互不相关的序列比对任务（批并行，任务级并行）
+这就是你习题采用的方案！
+你一共有 16 组独立 (seq1[k], seq2[k])，互相之间没有任何依赖，天然适合做成 lane 并行。
+
+2）为什么你产生 “无脑改造” 的观感？
+视频授课有取舍：
+讲师的教学目标不是讲授生物信息 DP，而是讲授「面向编译器自动向量化的代码书写范式」。
+算法只是载体（不管是点积、矩阵乘、序列比对，套路框架不变）；
+课程重心：数据布局、消除依赖、数组拓宽、循环规整；
+因此他会弱化算法原理，只演示固定改造流程，看起来像无脑模板。
+但对你而言不能无脑照搬，原因：
+这套改造有大量隐藏陷阱，如果你不知道 DP 变量各自含义，改到循环边界、初始化、更新 last_vertical_gap 时，很容易 lane 之间状态错乱，输出分数全部错误，而且极难调试。
+
+
+
+***********
+循环内的时序变量依赖不能跨 lane 混淆
+last_diagonal_score、last_vertical_gap 都是每条序列独立的状态，每个 lane 必须拥有独立副本。
+一旦不小心写成共享标量，16 组任务状态互相污染。
+GCC 自动向量化对循环结构敏感
+参考方案特意拆分循环、不写复杂分支；如果你直接生硬包裹 lane 循环，编译器无法向量化，得不到任何性能收益。

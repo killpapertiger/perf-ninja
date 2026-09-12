@@ -2,7 +2,7 @@
 
 #include <fstream>
 #include <stdexcept>
-
+// 由于计算 32 位数据块的 CRC 非常廉价[1]，因此该问题的性能瓶颈主要取决于我们向 CPU 提供这些 32 位数据块的速度。
 uint32_t solution(const char *file_name) {
   std::fstream file_stream{file_name};
   if (!file_stream.is_open())

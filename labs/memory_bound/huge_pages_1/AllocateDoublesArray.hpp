@@ -16,6 +16,8 @@
 // NOTE: See HugePagesSetupTips.md for how to enable huge pages in the OS
 #include <sys/mman.h>
 
+
+
 #elif defined(ON_WINDOWS)
 
 // HINT: allocate huge pages using VirtualAlloc/VirtualFree
@@ -149,6 +151,32 @@ inline bool setRequiredPrivileges() {
 
 #endif
 
+
+
+#if defined(ON_LINUX)
+inline auto allocateDoublesArray(size_t size) {
+    size_t total_array_size = sizeof(double) * size;
+    size_t page_2mb = (1UL << 21);
+    size_t pages_needed = total_array_size / page_2mb + (total_array_size % page_2mb == 0 ? 0 : 1);
+    size_t total_to_alloc = pages_needed * page_2mb;
+
+    void* ptr = mmap(nullptr, total_to_alloc, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (ptr == MAP_FAILED) {
+        throw std::bad_alloc{};
+    }
+    madvise(ptr, total_to_alloc, MADV_HUGEPAGE);
+    auto deleter = [total_to_alloc](void* ptr) {
+        munmap(ptr, total_to_alloc);
+    };
+    return std::unique_ptr<double[], decltype(deleter)>(static_cast<double*>(ptr), deleter);
+    
+}
+
+
+#elif defined(ON_WINDOWS)
+#else 
+
+
 // Allocate an array of doubles of size `size`, return it as a
 // std::unique_ptr<double[], D>, where `D` is a custom deleter type
 inline auto allocateDoublesArray(size_t size) {
@@ -168,3 +196,4 @@ inline auto allocateDoublesArray(size_t size) {
   // The more verbose version is meant to demonstrate the use of a custom
   // (potentially stateful) deleter
 }
+#endif

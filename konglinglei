@@ -1,0 +1,20 @@
+git checkout -b private/konglinglei
+./tools/make_benchmark_library.sh
+cd ../perf-ninja/labs/misc/warmup/
+rm -rf build/
+
+
+cmake -E make_directory build
+cd build
+cmake -DCMake_BUILD_TYPE=Release  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
+cmake --build . --config Release --parallel 8
+cmake --build . --target validateLab
+cmake --build . --target benchmarkLab
+
+
+cmake -E make_directory build
+cd build
+cmake -DCMake_BUILD_TYPE=Debug  -DCMAKE_C_FLAGS="-g" -DCMAKE_CXX_FLAGS="-g"
+cmake --build . --config Release --parallel 8
+cmake --build . --target validateLab
+cmake --build . --target benchmarkLab

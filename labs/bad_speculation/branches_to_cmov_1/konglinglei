@@ -1,0 +1,203 @@
+这是**康威生命游戏（Conway's Game of Life）**，一种经典的细胞自动机。
+
+### 基本规则
+
+游戏在一个二维网格上进行，每个格子是一个**细胞**，只有两种状态：
+
+- **1** = 活着
+- **0** = 死亡
+
+每一轮（generation），所有细胞根据它周围 **8 个邻居** 的存活数量，同时更新自己的状态。规则只有 4 条：
+
+| 当前细胞状态 | 活邻居数量 | 下一轮状态 | 原因 |
+|--------------|------------|------------|------|
+| 活（1）      | 0 或 1     | 死（0）    | 太孤独，死亡 |
+| 活（1）      | 2 或 3     | 活（1）    | 刚好，继续存活 |
+| 活（1）      | ≥ 4        | 死（0）    | 太拥挤，死亡 |
+| 死（0）      | 恰好 3     | 活（1）    | 繁殖，新生 |
+| 死（0）      | 其他       | 死（0）    | 保持死亡 |
+
+对应到代码里的 `switch`：
+
+```cpp
+switch(aliveNeighbours) {
+    case 0:
+    case 1:
+        future[i][j] = 0;           // 孤独死亡
+        break;
+    case 2:
+        future[i][j] = current[i][j]; // 保持原状（活的继续活，死的继续死）
+        break;
+    case 3:
+        future[i][j] = 1;           // 新生，或活细胞继续活
+        break;
+    default:                        // 4个及以上
+        future[i][j] = 0;           // 过度拥挤死亡
+}
+```
+
+### 程序在做什么？
+
+1. 生成 **16 个** 随机的 1024×1024 网格（约 30% 细胞初始为活）
+2. 对每个网格，连续模拟 **10 轮**
+3. 每轮结束后统计还活着的细胞数量，最后返回这 16 个网格的最终存活数
+
+### 代码中的关键过程（`simulateNext`）
+
+对每个细胞 `(i, j)`：
+
+1. **统计邻居**：看周围 8 个位置有多少是活的（注意处理边界，越界就跳过）
+2. **减去自己**：因为上面把中心细胞自己也加进去了，所以要减掉
+3. **根据规则**决定它下一轮是死是活，写入 `future`
+4. 全部算完后，`std::swap(current, future)`，进入下一轮
+
+### 为什么这个实验和分支预测有关？
+
+因为网格是随机的，每个细胞的 `aliveNeighbours` 值（0~8）几乎是随机出现的。  
+`switch` 里的分支就变得**非常难以预测**，CPU 的分支预测器经常猜错，导致大量流水线冲刷，性能下降。
+
+这就是你接下来要优化的点：把这些不可预测的分支，改成条件传送（`cmov`）等没有分支的形式。
+
+
+
+
+***************************************************
+https://github.com/rigtorp/SPSCQueue/blob/master/include/rigtorp/SPSCQueue.h
+  void pop() noexcept {
+    static_assert(std::is_nothrow_destructible<T>::value,
+                  "T must be nothrow destructible");
+    auto const readIdx = readIdx_.load(std::memory_order_relaxed);
+    assert(writeIdx_.load(std::memory_order_acquire) != readIdx &&
+           "Can only call pop() after front() has returned a non-nullptr");
+    slots_[readIdx + kPadding].~T();
+    auto nextReadIdx = readIdx + 1;
+    if (nextReadIdx == capacity_) {
+      nextReadIdx = 0;
+    }
+    readIdx_.store(nextReadIdx, std::memory_order_release);
+  }
+
+条件运算符与 cmov
+在 x86 上，像这样的代码：
+C++nextReadIdx = (nextReadIdx == capacity_) ? 0 : nextReadIdx;
+或更直接的：
+C++if (nextReadIdx == capacity_) nextReadIdx = 0;
+编译器在优化足够好的时候，经常会生成 cmov（conditional move）指令，而不是有风险的条件跳转。
+cmov 的特点是：
+
+不改变控制流（没有 branch）
+根据条件寄存器决定是否执行移动
+避免了分支预测失败带来的惩罚
+
+所以在很多情况下，用三元运算符或简单的 if 赋值，最终汇编效果和“无分支”已经非常接近。
+
+如果 内部的 capacity_ 是 2 的幂，可以改成位运算，完全去掉分支：
+nextReadIdx = (readIdx + 1) & (capacity_ - 1);
+这是标准且最快的写法。
+**************************************************************************************
+[https://duckdb.org/2021/08/27/external-sorting](https://duckdb.org/2021/08/27/external-sorting)
+```
+// 继续合并直到完成
+while (l_ptr && r_ptr) {
+  // 将比较结果存储在布尔值中  # entry is size parameter
+  bool left_less = memcmp(l_ptr, r_ptr, entry) < 0;
+  bool right_less = 1 - left_less;
+  // 从任意一边复制
+  memcpy(result_ptr, l_ptr, left_less * entry);
+  memcpy(result_ptr, r_ptr, right_less * entry);
+  // 前进任意一边
+  l_ptr += left_less * entry;
+  r_ptr += right_less * entry;
+  // 前进结果指针
+  result_ptr += entry;
+}
+```
+
+## **[Conclusion](https://duckdb.org/2021/08/27/external-sorting#conclusion)**
+
+[Read our paper on sorting at ICDE '23](https://hannes.muehleisen.org/publications/ICDE2023-sorting.pdf)
+
+**附录 A：谓词化（Predication）**
+
+我们用来加速归并排序的另一种技术是**谓词化**（predication）。使用这种技术，我们可以将带有 if/else 分支的代码转换为无分支代码。现代 CPU 会尝试预测 if 分支还是 else 分支会被执行。如果预测困难，就会减慢代码执行速度。请看下面带有分支的伪代码示例：
+
+C
+
+```
+// 继续合并直到完成
+while (l_ptr && r_ptr) {
+  // 检查哪一边更小
+  if (memcmp(l_ptr, r_ptr, entry) < 0) {
+    // 从左侧复制并前进
+    memcpy(result_ptr, l_ptr, entry);
+    l_ptr += entry;
+  } else {
+    // 从右侧复制并前进
+    memcpy(result_ptr, r_ptr, entry);
+    r_ptr += entry;
+  }
+  // 前进结果指针
+  result_ptr += entry;
+}
+```
+
+我们正在将左侧和右侧块的数据逐条合并到结果块中，通过推进指针完成。这种代码可以通过将比较的布尔值用作 0 或 1 来实现无分支，如下面的伪代码所示：
+
+C
+
+```
+// 继续合并直到完成
+while (l_ptr && r_ptr) {
+  // 将比较结果存储在布尔值中  # entry is size parameter
+  bool left_less = memcmp(l_ptr, r_ptr, entry) < 0;
+  bool right_less = 1 - left_less;
+  // 从任意一边复制
+  memcpy(result_ptr, l_ptr, left_less * entry);
+  memcpy(result_ptr, r_ptr, right_less * entry);
+  // 前进任意一边
+  l_ptr += left_less * entry;
+  r_ptr += right_less * entry;
+  // 前进结果指针
+  result_ptr += entry;
+}
+```
+
+当 left_less 为 true 时，它等于 1，这意味着 right_less 为 false，即等于 0。我们利用这一点从左侧复制 entry 个字节，从右侧复制 0 个字节，并相应地递增左右指针。
+**********************************************************************************
+在极致优化中，通常人们会建议减少分支预测，有个办法就是使用cmov，cmov会比跳转指令更快吗？
+不一定。`cmov`（条件移动指令）和普通分支跳转（`jmp`）的性能优劣，完全取决于一个关键因素：**分支的可预测性**。
+
+简单来说，`cmov` 是**用确定性的执行延迟，来换取消除分支预测失败的风险**。它是否更快，取决于这个“交换”是否划算。
+
+### ⚖️ 两种方案的对决
+
+我们可以通过一个场景来直观理解：每次都要判断“如果A大于B，则把C赋给D”。
+
+1.  **方案一：分支跳转 (branch + jmp)**
+    *   **特点**：CPU会使用**分支预测器**来“猜”结果。如果猜对了，它就会在等待比较结果的同时，提前执行选中的指令，效率极高。在现代CPU上，预测准确率通常超过97%。
+    *   **代价**：一旦**猜错（分支预测失败）**，就必须清空流水线并回退，这会产生巨大的延迟（通常10-20个时钟周期以上）。
+    *   **总结**：**预测率高时极快，预测失败时代价极大。**
+
+2.  **方案二：条件移动 (cmov)**
+    *   **特点**：这是一种“无分支”指令。CPU不猜，而是等待比较结果。无论结果是真是假，`cmov` 指令都会**完整执行**，但最终只根据结果将其中一个源操作数写入目标。
+    *   **代价**：它消除了分支预测失败的风险，但代价是：
+        *   **引入数据依赖**：`cmov` 的结果依赖于比较结果，会阻塞后续指令的执行。
+        *   **可能增加指令数**：在某些情况下，使用`cmov`的代码会比分支版本有更多的微操作（uops）。
+        *   **特殊场景更慢**：如果`cmov`的一个操作数需要从内存加载，它会**强制等待内存读取完成**，而分支版本可以“投机执行”其他代码，这可能导致`cmov`更慢。
+    *   **总结**：**执行时间稳定但通常偏慢，不会出现极端情况。**
+
+### 📊 一个历史的转折
+
+`cmov`的命运随着CPU架构的演进而改变。
+*   在**Pentium 4**等老架构上，`cmov`很受欢迎。
+*   但后来的**Intel Core和AMD Bulldozer**等现代架构，拥有了极强的分支预测器，使得预测正确的分支几乎“零成本”。在这种情况下，`cmov`往往是一个负担。
+*   不过，在**Intel Skylake及之后**的架构中，`cmov`的性能又得到了显著提升，使其在更多场景下变得有竞争力。
+
+### 💎 总结与启示
+
+所以，回到你的问题：“cmov会比跳转指令更快吗？”
+
+答案是：**“看情况”**。它在**分支完全不可预测（如随机数据）时，能提供可观的性能提升**；但在**分支高度可预测（如处理已排序数据）时，几乎总比分支跳转慢**。
+
+这其实也解释了为什么编译器优化如此复杂。在极致的性能优化中，并没有一个放之四海而皆准的“银弹”。即使是像`cmov`和分支跳转这样基础的指令选择，也成为一个需要编译器开发者根据CPU型号、数据特征和上下文，反复权衡和调整的“经典难题”。
+***********************************************************************************

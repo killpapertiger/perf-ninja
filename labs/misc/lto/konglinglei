@@ -1,0 +1,211 @@
+这段代码是 **LTO 实验的完整实现**，它用 AOBench（环境光遮蔽渲染器）作为测试用例，来演示 LTO（链接时优化）如何提升性能。
+
+我把整个工程的结构、数据流、编译策略和执行路径全部拆解给你看。
+
+---
+
+## 1. 工程结构（按你的文件）
+
+从你贴的文件来看，这个实验的源代码被刻意**分散在多个 `.c` / `.cpp` 文件**中：
+
+```
+ao.h                —— 全局头文件，声明所有函数、结构体、常量
+ao_bench.c          —— 入口点：ao_bench()，调用 init_scene, render, saveppm
+ao_helpers.c        —— 向量运算：vdot, vcross, vnormalize, clamp, saveppm
+ao_init.c           —— init_scene()：初始化三个球体和一个平面
+ao_intersect.c      —— 光线与球体/平面求交：ray_sphere_intersect, ray_plane_intersect
+ao_orthoBasis.c     —— 构造正交基：orthoBasis()
+ao_occlusion.c      —— AO 主算法：ambient_occlusion()
+ao_render.c         —— 渲染主循环：render()
+benchmark.cpp       —— Google Benchmark 入口，调用 ao_bench()
+validation.cpp      —— 验证输出图像与黄金图是否一致
+```
+
+**为什么分散？**  
+这正是 LTO 实验的核心设计：把本可以在同一个文件中内联的函数（如 `vdot`、`ray_sphere_intersect`）拆到不同的 `.c` 文件，让编译器**无法跨文件内联**，从而暴露性能问题。
+
+---
+
+## 2. 关键数据类型
+
+```c
+// 3D向量
+typedef struct _vec { double x, y, z; } vec;
+
+// 光线：原点 + 方向
+typedef struct _Ray { vec org; vec dir; } Ray;
+
+// 交点：距离t、交点坐标p、法线n、是否命中hit
+typedef struct _Isect { double t; vec p; vec n; int hit; } Isect;
+
+// 球体：中心 + 半径
+typedef struct _Sphere { vec center; double radius; } Sphere;
+
+// 平面：平面上一点p + 法线n
+typedef struct _Plane { vec p; vec n; } Plane;
+```
+
+**全局场景对象：**
+```c
+Sphere spheres[3];  // 三个球体
+Plane  plane;       // 地面
+```
+它们被声明在 `ao.h` 中为 `extern`，定义在 `benchmark.cpp` / `validation.cpp` 中，确保跨文件可见。
+
+---
+
+## 3. 光线求交（核心数学）
+
+**球体求交** (`ao_intersect.c`)：
+
+```
+给定光线 O + tD，球体中心 C，半径 R
+令 rs = O - C
+B = rs · D
+C' = rs · rs - R²
+D = B² - C'
+if D > 0:
+    t = -B - sqrt(D)   // 最近交点
+```
+
+**平面求交** (`ao_intersect.c`)：
+
+```
+平面方程：n · P + d = 0，其中 d = -n · p0
+光线代入：n · (O + tD) + d = 0
+t = -(n·O + d) / (n·D)
+```
+
+两个求交函数都使用 **`vdot`** 计算点积，但 `vdot` 被放在了 `ao_helpers.c`，跨文件调用无法内联。
+
+---
+
+## 4. AO 渲染算法（`ao_occlusion.c`）
+
+```c
+void ambient_occlusion(vec *col, const Isect *isect) {
+    // 1. 将交点沿法线方向微移，防止自交
+    p = isect->p + eps * isect->n;
+
+    // 2. 构造正交基 (法线为z轴)
+    orthoBasis(basis, isect->n);
+
+    // 3. 半球随机采样
+    for (j = 0; j < NAO_SAMPLES; j++) {
+        for (i = 0; i < NAO_SAMPLES; i++) {
+            theta = sqrt(mydrand48());      // 球面坐标
+            phi = 2 * PI * mydrand48();
+            // 局部坐标 → 全局坐标
+            // 发射光线
+            // 如果光线被遮挡，occlusion++
+        }
+    }
+    // 4. 返回未遮挡比例
+    col->x = col->y = col->z = occlusion / total;
+}
+```
+
+**性能关键点：**  
+每个像素要发射 `2×2×8×8 = 256` 条光线，每条光线要遍历 3 个球体和 1 个平面。整个画面 `256×256×256 = 1677万` 次光线求交，每个求交涉及浮点运算和跨文件函数调用。
+
+---
+
+## 5. 渲染流程（`ao_render.c`）
+
+```c
+for (y = 0; y < HEIGHT; y++) {
+    for (x = 0; x < WIDTH; x++) {
+        for (v = 0; v < NSUBSAMPLES; v++) {
+            for (u = 0; u < NSUBSAMPLES; u++) {
+                // 计算像素坐标 → 光线方向
+                px = (x + u/nsubsamples - WIDTH/2) / (WIDTH/2);
+                py = -(y + v/nsubsamples - HEIGHT/2) / (HEIGHT/2);
+                // 发射光线
+                ray.dir = (px, py, -1);
+                vnormalize(&ray.dir);
+                // 求交
+                ray_sphere_intersect(...);
+                ray_plane_intersect(...);
+                // 如果命中 → 计算 AO
+                if (isect.hit) ambient_occlusion(&col, &isect);
+            }
+        }
+        // 累加子采样 → 最终像素值
+    }
+}
+```
+
+`vnormalize` 和 `ray_sphere_intersect` 跨文件调用，无法内联。
+
+---
+
+## 6. 两个入口程序
+
+**`benchmark.cpp`：**
+```cpp
+static void bench1(benchmark::State &state) {
+  for (auto _ : state) {
+    ao_bench();   // ← 被测量的核心函数
+  }
+}
+BENCHMARK(bench1)->Unit(benchmark::kMillisecond);
+BENCHMARK_MAIN();
+```
+这个版本用于**性能测试**，运行在 Google Benchmark 框架下。
+
+**`validation.cpp`：**
+```cpp
+int main(int argc, char **argv) {
+    ao_bench();  // 生成 ao.ppm
+    // 与 golden.ppm 逐字节比较
+    if (inputContents != goldenContents) {
+        std::cerr << "Validation Failed\n";
+        return 1;
+    }
+    std::cout << "Validation Successful\n";
+}
+```
+用于**正确性验证**：确保代码生成的图像与标准答案完全一致。
+
+---
+
+## 7. LTO 为什么能加速？
+
+**没有 LTO：** 每个 `.c` 文件独立编译成 `.o`，链接时无法跨文件优化。
+
+```
+ao_helpers.o  →  vdot() / vnormalize()
+ao_intersect.o → ray_sphere_intersect() 调用 vdot()
+ao_occlusion.o → ambient_occlusion() 调用 orthoBasis()
+ao_render.o    → render() 调用 ray_sphere_intersect()
+```
+
+链接时**不能内联** `vdot` 到 `ray_sphere_intersect`，每次调用都要执行 CALL/RET 指令，且无法做寄存器分配优化。
+
+**启用 LTO (`-flto`)**：所有 `.o` 文件在链接时合并成中间表示（IR），编译器可以跨文件内联、常量传播、死代码消除。
+
+```
+vdot() 被内联到 ray_sphere_intersect()
+orthoBasis() 被内联到 ambient_occlusion()
+vnormalize() 被内联到多个调用点
+```
+
+**性能提升来源：**
+1. 消除函数调用开销
+2. 更激进的寄存器分配
+3. 自动向量化（内联后 SIMD 更容易触发）
+4. 常量折叠（如 `M_PI` 可以变成立即数）
+
+---
+
+## 8. 总结：这个实验在教什么？
+
+| 层面 | 内容 |
+|------|------|
+| **代码层** | 故意把代码拆成多个文件，暴露跨文件调用开销 |
+| **编译器层** | 用 LTO 解决这个开销 |
+| **性能层** | LTO 通过内联 + 优化，显著提升浮点密集计算的速度 |
+| **验证层** | 用 `validation.cpp` 确保优化不改变正确性 |
+| **测量层** | 用 `benchmark.cpp` 量化提升幅度 |
+
+这个实验的最终输出就是让你看到：**同样的代码，启用 LTO 后，因为跨文件函数被内联和优化，速度显著提升。** 这也是为什么很多高性能 C++ 项目（如 ClickHouse、LLVM）默认启用 LTO。
