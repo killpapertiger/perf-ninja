@@ -7,9 +7,9 @@ rm -rf build/
 cmake -E make_directory build
 cd build
 cmake -DCMake_BUILD_TYPE=Release  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-cmake --build . --config Release --parallel 8
+cmake --build . --config Release --parallel 8   # compile phrase，on windows visual studio , it is Multi-Config Generator.  --parallel 8 is equal -j8
 cmake --build . --target validateLab
-cmake --build . --target benchmarkLab
+cmake --build . --target benchmarkLab  # benchmarkLab is a custom target which run a command
 
 
 cmake -E make_directory build
@@ -18,3 +18,49 @@ cmake -DCMake_BUILD_TYPE=Debug  -DCMAKE_C_FLAGS="-g" -DCMAKE_CXX_FLAGS="-g"
 cmake --build . --config Release --parallel 8
 cmake --build . --target validateLab
 cmake --build . --target benchmarkLab
+
+
+
+# to compare benchmark result through goolgle benchmark compare.py
+
+# pip install numpy
+konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$ pwd
+/home/konglinglei/source/perf-ninja
+konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$ ls
+Contributing.md  QuickstartLinux.md  QuickstartWindows.md  benchmark  img          labs      tools
+GetStarted.md    QuickstartMacOS.md  README.md             buildbot   konglinglei  logo.jpg
+konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$ python3 -m venv .venv
+konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$ source .venv/bin/activate
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$ pip3 install numpy
+Collecting numpy
+  Downloading numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (6.6 kB)
+Downloading numpy-2.5.3-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (16.7 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 16.7/16.7 MB 2.1 MB/s eta 0:00:00
+Installing collected packages: numpy
+Successfully installed numpy-2.5.3
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja$
+
+
+ 
+#  pip3 install scipy
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/misc/warmup/build$ pip3 install scipy
+Collecting scipy
+  Downloading scipy-1.18.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (62 kB)
+     ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 62.4/62.4 kB 376.9 kB/s eta 0:00:00
+Requirement already satisfied: numpy<2.8,>=2.0.0 in /home/konglinglei/source/perf-ninja/.venv/lib/python3.12/site-packages (from scipy) (2.5.3)
+Downloading scipy-1.18.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (35.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 35.3/35.3 MB 3.0 MB/s eta 0:00:00
+Installing collected packages: scipy
+Successfully installed scipy-1.18.1
+
+
+
+# call compare.py
+# https://google.github.io/benchmark/tools.html
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/misc/warmup/build$ python3 ../../../../tools/benchmark/tools/compare.py benchmarks old.result.json result.json
+Comparing old.result.json to result.json
+Benchmark                         Time             CPU      Time Old      Time New       CPU Old       CPU New
+--------------------------------------------------------------------------------------------------------------
+bench1                         -0.9350         -0.9350            23             1            25             2
+OVERALL_GEOMEAN                -0.9350         -0.9350             0             0             0             0
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/misc/warmup/build$

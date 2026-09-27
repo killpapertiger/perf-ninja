@@ -61,7 +61,7 @@ public:
                 // The cell needs to be subtracted from
                 // its neighbours as it was counted before
                 aliveNeighbours -= current[i][j];
-
+                /*
                 // Implementing the Rules of Life:
                 switch(aliveNeighbours) {
                     // 1. Cell is lonely and dies
@@ -81,6 +81,15 @@ public:
                     default:
                         future[i][j] = 0;
                 }
+                */
+                int cur = 0;
+                if (__builtin_unpredictable(aliveNeighbours == 2)) {
+                  cur = current[i][j];
+                } else if (__builtin_unpredictable(aliveNeighbours == 3)) {
+                  cur = 1;
+                }
+                future[i][j] = cur;
+                
             }
         }
         std::swap(current, future);

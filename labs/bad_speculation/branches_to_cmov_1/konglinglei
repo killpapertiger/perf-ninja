@@ -1,3 +1,349 @@
+
+
+### 翻译内容
+
+**TODO：需要添加一段介绍视频和一段总结视频。**
+
+这就是经典的"生命游戏"。程序会生成 10 个随机的 1024×1024 网格（棋盘），并模拟接下来 10 轮生命游戏。它先模拟第一个棋盘的 10 轮，然后处理第二个棋盘，依此类推。
+
+按照当前的写法，程序会产生大量的**分支预测错误（branch mispredictions）**。你的任务是找到它们发生的位置，并用**条件指令（predicate instructions）**替换它们。在 x86 平台上，你应该能看到 `cmov` 指令（提示：使用 `__builtin_unpredictable`，确保已安装 Clang-17 或更高版本）。在 ARM 平台上，你应该能看到 `csel`（条件选择）指令。在开始修改实际代码之前，建议先在 godbolt.org 上实验一下代码。
+
+**附加题：** 当你修复了主要的预测错误来源后，热点循环嵌套中仍然残留着许多分支。你该如何消除它们？
+
+---
+
+### 提示
+
+**提示 1：**
+
+你找到代码中可能存在大量分支预测错误的部分了吗？有没有哪些区域，你很难根据随机输入来判断代码会走哪条分支？
+
+**提示 2：**
+
+一个很好的起点是找出涉及 `if` 或 `switch` 的代码语句，这些语句由于输入数据的特性，其结果很难被预测。这些地方很可能给硬件分支预测器带来问题。你可以通过 `perf record` 等工具进行性能分析，并查看它高亮标记为分支预测错误原因的代码来验证你的想法。
+
+**提示 3：**
+
+需要重点关注的核心代码段如下：
+
+```cpp
+// 实现生命游戏规则：
+switch(aliveNeighbours) {
+    // 1. 细胞孤单，死亡
+    case 0:
+    case 1:
+        future[i][j] = 0;
+        break;                   
+    // 2. 保持不变
+    case 2:
+        future[i][j] = current[i][j];
+        break;
+    // 3. 新细胞诞生
+    case 3:
+        future[i][j] = 1;
+        break;
+    // 4. 细胞因过度拥挤而死亡
+    default:
+        future[i][j] = 0;
+}
+```
+
+注意，许多分支可以通过以下观察来消除：`future[i][j]` 的值只有在 `aliveNeighbours` 为 2 或 3 时才不为 0。之后，我们可以使用 `__builtin_unpredictable()`（如果在 x86 上使用 Clang 17+）来给编译器一个提示，告知这些分支很难被预测。反过来，这个内置函数可以帮助编译器生成更合适的汇编代码来减少分支的影响，即生成 `cmov` 指令。
+
+---
+
+### 参考解答
+
+**背景：**
+
+本实验的目标是用**条件移动（conditional moves）**替换不可预测的分支。条件移动 `cmov` 不一定总是比带分支的代码更快，但在这种情况下，由于分支不可预测，我们应该预期（也确实观察到）性能提升。
+
+**解答：**
+
+分支集中的主要代码段如下：
+
+```cpp
+// 实现生命游戏规则：
+switch(aliveNeighbours) {
+    // 1. 细胞孤单，死亡
+    case 0:
+    case 1:
+        future[i][j] = 0;
+        break;                   
+    // 2. 保持不变
+    case 2:
+        future[i][j] = current[i][j];
+        break;
+    // 3. 新细胞诞生
+    case 3:
+        future[i][j] = 1;
+        break;
+    // 4. 细胞因过度拥挤而死亡
+    default:
+        future[i][j] = 0;
+}
+```
+
+上述代码的汇编输出可以在此处查看。
+
+（注意：上述代码片段是在未启用优化的情况下编译的，仅用于说明目的；由于没有为 `future` 和 `current` 提供测试数据，`-O3` 会优化掉大部分汇编指令，因为它注意到 `future[i][j]` 的值将保持为 0，即不变，除非 `aliveNeighbours == 3`。）
+
+由此，我们可以注意到 `future[i][j]` 的最终结果有三种情况：
+
+- `future[i][j] = 0` —— 当 `aliveNeighbours` 为 2 或 3 以外的任何值时。
+- `future[i][j] = current[i][j]` —— 当 `aliveNeighbours` 等于 2 时，保持不变。
+- `future[i][j] = 1` —— 当 `aliveNeighbours` 等于 3 时。
+
+这表明我们可以先假设 `future[i][j]` 等于 0，然后只针对 `aliveNeighbours == 2` 或 `aliveNeighbours == 3` 的情况编写改变结果的代码。这将简化分支逻辑。
+
+```cpp
+// 实现生命游戏规则：
+int cell_value = 0;
+if (aliveNeighbours == 2) {
+    cell_value = current[i][j];
+} else if (aliveNeighbours == 3) {
+    cell_value = 1;
+}
+future[i][j] = cell_value;
+```
+
+这已经是一种改进，但我们仍然没有完全消除分支。
+
+要做到这一点，我们需要借助编译器内置函数。鉴于 `aliveNeighbours` 的值不可预测，当前代码的性能将受到严重的分支预测错误惩罚。在 x86 平台上，我们在 Clang（17+ 版本）上使用内置函数 `__builtin_unpredictable()` 来表明该分支无法被硬件预测方法所预测。这将帮助编译器生成更好的汇编代码。
+
+```cpp
+// 实现生命游戏规则：
+int cell_value = 0;
+if (__builtin_unpredictable(aliveNeighbours == 2)) {
+    cell_value = current[i][j];
+} else if (__builtin_unpredictable(aliveNeighbours == 3)) {
+    cell_value = 1;
+}
+future[i][j] = cell_value;
+```
+
+---
+
+另外，你上传的 godbolt.org 网页内容是该网站（Compiler Explorer）的界面元素和菜单文本，属于网站 UI 层面的内容，与这个 lab 的练习本身没有直接关系，所以没有翻译。如果你需要我对 godbolt 的某个具体用法做解释，随时告诉我。
+
+
+
+
+```cpp
+// godbolt.org
+// https://godbolt.org/
+// Type your code here, or load an example.
+#include <vector>
+#include <cstdlib>
+using Grid = std::vector<std::vector<int>>;
+Grid current;
+Grid future;
+
+int test(int num) {
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            int aliveNeighbours = rand() % 5;
+            switch(aliveNeighbours) {
+                    // 1. Cell is lonely and dies
+                    case 0:
+                    case 1:
+                        future[i][j] = 0;
+                        break;                   
+                    // 2. Remains the same
+                    case 2:
+                        future[i][j] = current[i][j];
+                        break;
+                    // 3. A new cell is born
+                    case 3:
+                        future[i][j] = 1;
+                        break;
+                    // 4. Cell dies due to over population
+                    default:
+                        future[i][j] = 0;
+                }
+        }
+    }
+    
+}
+```
+
+生成的汇编
+```cpp
+
+        .set    std::_Vector_base<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::_Vector_impl::~_Vector_impl() [complete object destructor],_ZNSt12_Vector_baseISt6vectorIiSaIiEESaIS2_EE12_Vector_implD2Ev
+        .set    std::_Vector_base<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::_Vector_base() [complete object constructor],_ZNSt12_Vector_baseISt6vectorIiSaIiEESaIS2_EEC2Ev
+        .set    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::vector() [complete object constructor],_ZNSt6vectorIS_IiSaIiEESaIS1_EEC2Ev
+current:
+        .zero   24
+future:
+        .zero   24
+test(int):
+        push    rbp
+        mov     rbp, rsp
+        push    rbx
+        sub     rsp, 40
+        mov     DWORD PTR [rbp-36], edi
+        mov     DWORD PTR [rbp-20], 0
+        jmp     .L5
+.L14:
+        mov     DWORD PTR [rbp-24], 0
+        jmp     .L6
+.L13:
+        call    rand
+        mov     edx, eax
+        movsx   rax, edx
+        imul    rax, rax, 1717986919
+        shr     rax, 32
+        sar     eax
+        mov     ecx, edx
+        sar     ecx, 31
+        sub     eax, ecx
+        mov     DWORD PTR [rbp-28], eax
+        mov     ecx, DWORD PTR [rbp-28]
+        mov     eax, ecx
+        sal     eax, 2
+        add     eax, ecx
+        sub     edx, eax
+        mov     DWORD PTR [rbp-28], edx
+        cmp     DWORD PTR [rbp-28], 3
+        je      .L7
+        cmp     DWORD PTR [rbp-28], 3
+        jg      .L8
+        cmp     DWORD PTR [rbp-28], 1
+        jg      .L9
+        cmp     DWORD PTR [rbp-28], 0
+        jns     .L10
+        jmp     .L8
+.L9:
+        cmp     DWORD PTR [rbp-28], 2
+        je      .L11
+        jmp     .L8
+.L10:
+        mov     eax, DWORD PTR [rbp-20]
+        cdqe
+        mov     rsi, rax
+        mov     edi, OFFSET FLAT:future
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::operator[](unsigned long)
+        mov     rdx, rax
+        mov     eax, DWORD PTR [rbp-24]
+        cdqe
+        mov     rsi, rax
+        mov     rdi, rdx
+        call    std::vector<int, std::allocator<int>>::operator[](unsigned long)
+        mov     DWORD PTR [rax], 0
+        jmp     .L12
+.L11:
+        mov     eax, DWORD PTR [rbp-20]
+        cdqe
+        mov     rsi, rax
+        mov     edi, OFFSET FLAT:current
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::operator[](unsigned long)
+        mov     rdx, rax
+        mov     eax, DWORD PTR [rbp-24]
+        cdqe
+        mov     rsi, rax
+        mov     rdi, rdx
+        call    std::vector<int, std::allocator<int>>::operator[](unsigned long)
+        mov     ebx, DWORD PTR [rax]
+        mov     eax, DWORD PTR [rbp-20]
+        cdqe
+        mov     rsi, rax
+        mov     edi, OFFSET FLAT:future
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::operator[](unsigned long)
+        mov     rdx, rax
+        mov     eax, DWORD PTR [rbp-24]
+        cdqe
+        mov     rsi, rax
+        mov     rdi, rdx
+        call    std::vector<int, std::allocator<int>>::operator[](unsigned long)
+        mov     DWORD PTR [rax], ebx
+        jmp     .L12
+.L7:
+        mov     eax, DWORD PTR [rbp-20]
+        cdqe
+        mov     rsi, rax
+        mov     edi, OFFSET FLAT:future
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::operator[](unsigned long)
+        mov     rdx, rax
+        mov     eax, DWORD PTR [rbp-24]
+        cdqe
+        mov     rsi, rax
+        mov     rdi, rdx
+        call    std::vector<int, std::allocator<int>>::operator[](unsigned long)
+        mov     DWORD PTR [rax], 1
+        jmp     .L12
+.L8:
+        mov     eax, DWORD PTR [rbp-20]
+        cdqe
+        mov     rsi, rax
+        mov     edi, OFFSET FLAT:future
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::operator[](unsigned long)
+        mov     rdx, rax
+        mov     eax, DWORD PTR [rbp-24]
+        cdqe
+        mov     rsi, rax
+        mov     rdi, rdx
+        call    std::vector<int, std::allocator<int>>::operator[](unsigned long)
+        mov     DWORD PTR [rax], 0
+.L12:
+        add     DWORD PTR [rbp-24], 1
+.L6:
+        cmp     DWORD PTR [rbp-24], 99
+        jle     .L13
+        add     DWORD PTR [rbp-20], 1
+.L5:
+        cmp     DWORD PTR [rbp-20], 99
+        jle     .L14
+        ud2
+        .set    std::_Vector_base<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::_Vector_impl::_Vector_impl() [complete object constructor],_ZNSt12_Vector_baseISt6vectorIiSaIiEESaIS2_EE12_Vector_implC2Ev
+        .set    std::_Vector_base<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~_Vector_base() [complete object destructor],_ZNSt12_Vector_baseISt6vectorIiSaIiEESaIS2_EED2Ev
+.LC0:
+        .string "__n < this->size()"
+.LC1:
+        .string "std::vector<_Tp, _Alloc>::reference std::vector<_Tp, _Alloc>::operator[](size_type) [with _Tp = std::vector<int>; _Alloc = std::allocator<std::vector<int> >; reference = std::vector<int>&; size_type = long unsigned int]"
+.LC2:
+        .string "/cefs/22/22e6cdc013c8541ce3d1548e_consolidated/compilers_c++_x86_gcc_15.2.0/include/c++/15.2.0/bits/stl_vector.h"
+.LC3:
+        .string "std::vector<_Tp, _Alloc>::reference std::vector<_Tp, _Alloc>::operator[](size_type) [with _Tp = int; _Alloc = std::allocator<int>; reference = int&; size_type = long unsigned int]"
+        .set    std::_Vector_base<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::_Vector_impl_data::_Vector_impl_data() [complete object constructor],_ZNSt12_Vector_baseISt6vectorIiSaIiEESaIS2_EE17_Vector_impl_dataC2Ev
+        .set    std::__new_allocator<std::vector<int, std::allocator<int>>>::~__new_allocator() [complete object destructor],_ZNSt15__new_allocatorISt6vectorIiSaIiEEED2Ev
+__static_initialization_and_destruction_0():
+        push    rbp
+        mov     rbp, rsp
+        mov     edi, OFFSET FLAT:current
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::vector() [complete object constructor]
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     esi, OFFSET FLAT:current
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        call    __cxa_atexit
+        mov     edi, OFFSET FLAT:future
+        call    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::vector() [complete object constructor]
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     esi, OFFSET FLAT:future
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        call    __cxa_atexit
+        nop
+        pop     rbp
+        ret
+        .set    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor],_ZNSt6vectorIS_IiSaIiEESaIS1_EED2Ev
+        .set    std::vector<int, std::allocator<int>>::~vector() [complete object destructor],_ZNSt6vectorIiSaIiEED2Ev
+        .set    std::_Vector_base<int, std::allocator<int>>::_Vector_impl::~_Vector_impl() [complete object destructor],_ZNSt12_Vector_baseIiSaIiEE12_Vector_implD2Ev
+        .set    std::_Vector_base<int, std::allocator<int>>::~_Vector_base() [complete object destructor],_ZNSt12_Vector_baseIiSaIiEED2Ev
+        .set    std::__new_allocator<int>::~__new_allocator() [complete object destructor],_ZNSt15__new_allocatorIiED2Ev
+_GLOBAL__sub_I_current:
+        push    rbp
+        mov     rbp, rsp
+        call    __static_initialization_and_destruction_0()
+        pop     rbp
+        ret
+```
+
+
+
+
+
+*****************************************************
+
 这是**康威生命游戏（Conway's Game of Life）**，一种经典的细胞自动机。
 
 ### 基本规则
@@ -201,3 +547,578 @@ while (l_ptr && r_ptr) {
 
 这其实也解释了为什么编译器优化如此复杂。在极致的性能优化中，并没有一个放之四海而皆准的“银弹”。即使是像`cmov`和分支跳转这样基础的指令选择，也成为一个需要编译器开发者根据CPU型号、数据特征和上下文，反复权衡和调整的“经典难题”。
 ***********************************************************************************
+
+clang 17+ 版本有__builtin_unpredictable()，那么gcc有没有？
+**GCC 没有 `__builtin_unpredictable()`**，这是 Clang 17+ 独有的内置函数。GCC 处理不可预测分支需采用替代方案，核心对比与实操建议如下：
+
+### 核心差异对比
+| 特性 | Clang 17+ | GCC |
+|---|---|---|
+| 不可预测分支提示 | `__builtin_unpredictable()` | **无对应内置函数** |
+| 静态概率提示 | 支持 | `__builtin_expect()` |
+| C++20 标准属性 | 支持 | 支持（GCC 9+） |
+| PGO 优化 | 支持 | 支持 |
+
+### GCC 实操方案
+1. **`__builtin_expect()` / `[[likely]]` / `[[unlikely]]`**：适合冷热路径明确的场景，通过调整代码布局（如将冷代码移至 `.text.unlikely` 段）减少 I-Cache 污染，但**无法强制生成条件移动指令**。
+2. **PGO（Profile-Guided Optimization）**：通过收集运行时分支数据指导优化，是 GCC 应对不可预测分支的最佳实践。
+3. **手动消除分支**：在量化交易等对延迟极其敏感的纳秒级核心引擎场景中，最可靠的方式仍是手动将 `switch` 重构为无分支表达式或查表法，而非依赖编译器内置函数。
+
+**总结**：`__builtin_unpredictable()` 是 Clang 的专属特性。在 GCC 环境下，若需极致性能调优，建议优先结合 PGO 或直接手动重构无分支代码。
+
+---
+需要我帮你把 `__builtin_expect()` 加进这个生命游戏的代码里，直接给你一个 GCC 版本的参考写法吗？
+************************************************************************
+```cpp
+ // The cell needs to be subtracted from
+                // its neighbours as it was counted before
+                aliveNeighbours -= current[i][j];
+                /*
+                // Implementing the Rules of Life:
+                switch(aliveNeighbours) {
+                    // 1. Cell is lonely and dies
+                    case 0:
+                    case 1:
+                        future[i][j] = 0;
+                        break;
+                    // 2. Remains the same
+                    case 2:
+                        future[i][j] = current[i][j];
+                        break;
+                    // 3. A new cell is born
+                    case 3:
+                        future[i][j] = 1;
+                        break;
+                    // 4. Cell dies due to over population
+                    default:
+                        future[i][j] = 0;
+                }
+                */
+                int cur = 0;
+                if (aliveNeighbours == 2) {
+                  cur = current[i][j];
+                } else if (aliveNeighbours == 3) {
+                  cur = 1;
+                }
+                future[i][j] = cur;
+
+```
+我改成这个版本的代码，执行更慢了
+
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$ python3 ../../../../tools/benchmark/tools/compare.py benchmarks old.result.json result.json
+Comparing old.result.json to result.json
+Benchmark                         Time             CPU      Time Old      Time New       CPU Old       CPU New
+--------------------------------------------------------------------------------------------------------------
+bench1                         +0.0824         +0.0832           873           945           872           945
+OVERALL_GEOMEAN                +0.0824         +0.0832             1             1             1             1
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$
+
+
+***************************************************************************************
+
+修改前：
+“cpp
+// Type your code here, or load an example.
+#include <vector>
+#include <cstdlib>
+using Grid = std::vector<std::vector<int>>;
+Grid current;
+Grid future;
+
+
+
+int test(int num) {
+  //
+   // 此书是我自己修改的，原作者没有使用这两个循环设置current[i][j],所以current[i][j]都是默认值
+   // 这一点原作者也提到了。所以原作者在使用godbolt.org的时候没有使用-O3等优化选项，可能是为了保持下面switch的原始汇编
+   // 因为我在找google benchmark测试，自己修改后的版本反而比修改前的版本还慢的原因。而google benchmark使用了-O3选项，
+   // 所以加上了这个随机化current二维数组中值的循环
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            current[i][j] = rand();
+        }
+    }
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            int aliveNeighbours = rand() % 5;
+
+        
+            // verison 1
+            switch(aliveNeighbours) {
+                    // 1. Cell is lonely and dies
+                    case 0:
+                    case 1:
+                        future[i][j] = 0;
+                        break;                   
+                    // 2. Remains the same
+                    case 2:
+                        future[i][j] = current[i][j];
+                        break;
+                    // 3. A new cell is born
+                    case 3:
+                        future[i][j] = 1;
+                        break;
+                    // 4. Cell dies due to over population
+                    default:
+                        future[i][j] = 0;
+            }
+            /*
+            // version 2
+            int cur = 0;
+            if (aliveNeighbours == 2) {
+                cur = current[i][j];
+            } else if (aliveNeighbours == 3) {
+                cur = 1;
+            }
+            future[i][j] = cur;
+            */
+        }
+    }
+    
+}```
+ 的汇编是
+```cpp
+        .set    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor],_ZNSt6vectorIS_IiSaIiEESaIS1_EED2Ev
+test(int):
+        push    rbp
+        xor     ebp, ebp
+        push    rbx
+        sub     rsp, 8
+.L11:
+        xor     ebx, ebx
+.L12:
+        call    rand
+        mov     edx, eax
+        mov     rax, QWORD PTR current[rip]
+        mov     rax, QWORD PTR [rax+rbp]
+        mov     DWORD PTR [rax+rbx], edx
+        add     rbx, 4
+        cmp     rbx, 400
+        jne     .L12
+        add     rbp, 24
+        cmp     rbp, 2400
+        jne     .L11
+        xor     ebp, ebp
+.L13:
+        xor     ebx, ebx
+        jmp     .L16
+.L22:
+        cmp     eax, 3
+        sete    al
+        add     rbx, 4
+        movzx   eax, al
+        mov     DWORD PTR [rdx], eax
+        cmp     rbx, 400
+        je      .L21
+.L16:
+        call    rand
+        mov     edx, eax
+        cdqe
+        imul    rax, rax, 1717986919
+        mov     ecx, edx
+        sar     ecx, 31
+        sar     rax, 33
+        sub     eax, ecx
+        lea     ecx, [rax+rax*4]
+        mov     eax, edx
+        mov     rdx, QWORD PTR future[rip]
+        sub     eax, ecx
+        mov     rsi, QWORD PTR [rdx+rbp]
+        add     rsi, rbx
+        mov     rdx, rsi
+        cmp     eax, 2
+        jne     .L22
+        mov     rax, QWORD PTR current[rip]
+        mov     rax, QWORD PTR [rax+rbp]
+        mov     eax, DWORD PTR [rax+rbx]
+        add     rbx, 4
+        mov     DWORD PTR [rdx], eax
+        cmp     rbx, 400
+        jne     .L16
+.L21:
+        add     rbp, 24
+        jmp     .L13
+_GLOBAL__sub_I_current:
+        sub     rsp, 8
+        pxor    xmm0, xmm0
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     esi, OFFSET FLAT:current
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        movaps  XMMWORD PTR current[rip], xmm0
+        mov     QWORD PTR current[rip+16], 0
+        call    __cxa_atexit
+        pxor    xmm0, xmm0
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     QWORD PTR future[rip+16], 0
+        movaps  XMMWORD PTR future[rip], xmm0
+        mov     esi, OFFSET FLAT:future
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        add     rsp, 8
+        jmp     __cxa_atexit
+future:
+        .zero   24
+current:
+        .zero   24
+```
+
+
+而修改后的版本：
+```cpp
+// Type your code here, or load an example.
+#include <vector>
+#include <cstdlib>
+using Grid = std::vector<std::vector<int>>;
+Grid current;
+Grid future;
+
+
+
+int test(int num) {
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            current[i][j] = rand();
+        }
+    }
+    for (int i = 0; i < 100; i++) {
+        for (int j = 0; j < 100; j++) {
+            int aliveNeighbours = rand() % 5;
+
+            /*
+            // verison 1
+            switch(aliveNeighbours) {
+                    // 1. Cell is lonely and dies
+                    case 0:
+                    case 1:
+                        future[i][j] = 0;
+                        break;                   
+                    // 2. Remains the same
+                    case 2:
+                        future[i][j] = current[i][j];
+                        break;
+                    // 3. A new cell is born
+                    case 3:
+                        future[i][j] = 1;
+                        break;
+                    // 4. Cell dies due to over population
+                    default:
+                        future[i][j] = 0;
+            }*/
+            
+            // version 2
+            int cur = 0;
+            if (aliveNeighbours == 2) {
+                cur = current[i][j];
+            } else if (aliveNeighbours == 3) {
+                cur = 1;
+            }
+            future[i][j] = cur;
+            
+        }
+    }
+    
+} 
+```
+的汇编是：
+```shell
+        .set    std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor],_ZNSt6vectorIS_IiSaIiEESaIS1_EED2Ev
+test(int):
+        push    rbp
+        xor     ebp, ebp
+        push    rbx
+        sub     rsp, 8
+.L11:
+        xor     ebx, ebx
+.L12:
+        call    rand
+        mov     edx, eax
+        mov     rax, QWORD PTR current[rip]
+        mov     rax, QWORD PTR [rax+rbp]
+        mov     DWORD PTR [rax+rbx], edx
+        add     rbx, 4
+        cmp     rbx, 400
+        jne     .L12
+        add     rbp, 24
+        cmp     rbp, 2400
+        jne     .L11
+        xor     ebp, ebp
+.L13:
+        xor     ebx, ebx
+.L17:
+        call    rand
+        mov     edx, eax
+        cdqe
+        imul    rax, rax, 1717986919
+        mov     ecx, edx
+        sar     ecx, 31
+        sar     rax, 33
+        sub     eax, ecx
+        lea     ecx, [rax+rax*4]
+        mov     eax, edx
+        sub     eax, ecx
+        cmp     eax, 2
+        je      .L21
+        mov     rdx, QWORD PTR future[rip]
+        cmp     eax, 3
+        sete    al
+        mov     rdx, QWORD PTR [rdx+rbp]
+        movzx   eax, al
+        mov     DWORD PTR [rdx+rbx], eax
+        add     rbx, 4
+        cmp     rbx, 400
+        jne     .L17
+        add     rbp, 24
+        jmp     .L13
+.L21:
+        mov     rax, QWORD PTR current[rip]
+        mov     rax, QWORD PTR [rax+rbp]
+        mov     edx, DWORD PTR [rax+rbx]
+        mov     rax, QWORD PTR future[rip]
+        mov     rax, QWORD PTR [rax+rbp]
+        mov     DWORD PTR [rax+rbx], edx
+        add     rbx, 4
+        cmp     rbx, 400
+        jne     .L17
+        add     rbp, 24
+        jmp     .L13
+_GLOBAL__sub_I_current:
+        sub     rsp, 8
+        pxor    xmm0, xmm0
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     esi, OFFSET FLAT:current
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        movaps  XMMWORD PTR current[rip], xmm0
+        mov     QWORD PTR current[rip+16], 0
+        call    __cxa_atexit
+        pxor    xmm0, xmm0
+        mov     edx, OFFSET FLAT:__dso_handle
+        mov     QWORD PTR future[rip+16], 0
+        movaps  XMMWORD PTR future[rip], xmm0
+        mov     esi, OFFSET FLAT:future
+        mov     edi, OFFSET FLAT:std::vector<std::vector<int, std::allocator<int>>, std::allocator<std::vector<int, std::allocator<int>>>>::~vector() [complete object destructor]
+        add     rsp, 8
+        jmp     __cxa_atexit
+future:
+        .zero   24
+current:
+        .zero   24
+```
+
+问ai也没说出个所以然来
+
+所以暂时先不看了
+
+以上测试使用的是gcc编译器
+为了测试clang编译器支持的__built_unpredictable，我换用clang编译器看看性能
+**************************************************************
+
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$ rm -rf *
+
+cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_FLAGS="-g --gcc-toolchain=/usr" \
+  -DCMAKE_CXX_FLAGS="-g --gcc-toolchain=/usr" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -lstdc++" \
+  -DCMAKE_C_COMPILER=/home/konglinglei/source/llvm-project-main/install/bin/clang-24 \
+  -DCMAKE_CXX_COMPILER=/home/konglinglei/source/llvm-project-main/install/bin/clang-24 \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+cmake --build . --target validateLab
+CMake Warning (deprecated) at CMakeLists.txt:1 (cmake_minimum_required):
+  Compatibility with CMake < 3.10 will be removed from a future version of
+  CMake.
+
+  Update the VERSION argument <min> value.  Or, use the <min>...<max> syntax
+  to tell CMake that the project requires at least <min> but has been updated
+  to work with policies introduced by <max> or earlier.
+This warning is for project developers.  Use -Wno-author or -Wno-deprecated
+to suppress it.
+
+-- The C compiler identification is Clang 24.0.0
+-- The CXX compiler identification is Clang 24.0.0
+-- Detecting C compiler ABI info
+-- Detecting C compiler ABI info - done
+-- Check for working C compiler: /home/konglinglei/source/llvm-project-main/install/bin/clang-24 - skipped
+-- Detecting C compile features
+-- Detecting C compile features - done
+-- Detecting CXX compiler ABI info
+-- Detecting CXX compiler ABI info - done
+-- Check for working CXX compiler: /home/konglinglei/source/llvm-project-main/install/bin/clang-24 - skipped
+-- Detecting CXX compile features
+-- Detecting CXX compile features - done
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD
+-- Performing Test CMAKE_HAVE_LIBC_PTHREAD - Success
+-- Found Threads: TRUE
+-- Configuring done (5.1s)
+-- Generating done (0.0s)
+-- Build files have been written to: /home/konglinglei/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build
+[ 25%] Building CXX object CMakeFiles/validate.dir/validate.cpp.o
+[ 50%] Building CXX object CMakeFiles/validate.dir/init.cpp.o
+[ 75%] Building CXX object CMakeFiles/validate.dir/solution.cpp.o
+[100%] Linking CXX executable validate
+[100%] Built target validate
+Validation Successful
+[100%] Built target validateLab
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$ cmake --build . --target benchmarkLab
+[ 25%] Building CXX object CMakeFiles/lab.dir/bench.cpp.o
+[ 50%] Building CXX object CMakeFiles/lab.dir/init.cpp.o
+[ 75%] Building CXX object CMakeFiles/lab.dir/solution.cpp.o
+[100%] Linking CXX executable lab
+[100%] Built target lab
+2026-09-26T20:23:38+08:00
+Running ./lab
+Run on (16 X 3792.93 MHz CPU s)
+CPU Caches:
+  L1 Data 32 KiB (x8)
+  L1 Instruction 32 KiB (x8)
+  L2 Unified 1024 KiB (x8)
+  L3 Unified 16384 KiB (x1)
+Load Average: 0.14, 0.05, 0.01
+-----------------------------------------------------
+Benchmark           Time             CPU   Iterations
+-----------------------------------------------------
+bench1           1189 ms         1231 ms            2
+[100%] Built target benchmarkLab
+(.venv) konglinglei@LAPTOP-0799F40N:~/source/perf-ninja/labs/bad_speculation/branches_to_cmov_1/build$
+
+****************************************************************
+
+
+上面的
+这说明你的工具链组合是：Clang-24 编译器 + lld 链接器 + GCC libstdc++ 标准库——这是 Linux 上最常见的 Clang 使用方式，完全没问题。
+
+
+如果cmake只指定clang，不指定连接器，就会找系统中默认的连接器
+***********************************************************************************
+
+我一直以为使用了clang-24编译器，,就自动选择了连接器（llvm的）
+**你的理解有偏差：Clang 在 Linux 上默认不会自动选择 LLVM 的 lld 链接器，而是使用系统的 `ld`（GNU ld）。** 这是一个非常普遍的误解，背后的原因涉及 LLVM 的设计哲学。
+
+### 为什么 Clang 不自动用 lld？
+
+**核心原因：Clang 被设计为系统编译器的"即插即用替代品"（drop-in replacement）。**
+
+LLVM 社区在讨论是否将 lld 设为默认链接器时，明确表达了以下考量：
+
+> *"如果 Clang 使用了一个与宿主系统默认不同的链接器，会造成混淆。"*
+
+具体来说：
+
+* **尊重宿主系统**：Clang 默认在 `PATH` 中寻找名为 `ld` 的可执行文件，而系统管理员通过符号链接决定 `/usr/bin/ld` 指向谁（可能是 `ld.bfd`、`ld.gold` 或 `ld.lld`）。Clang 不会擅自替换这个选择。
+* **ABI 兼容性**：Clang 在 Linux 上默认链接 GCC 的 `libstdc++` 而非 LLVM 的 `libc++`，链接器也同理——使用系统默认的 GNU ld 能保证与现有构建系统的兼容性。
+* **跨平台一致性**：在 macOS 上 Clang 默认用 `ld64`（Apple 的链接器），在 Windows 上用 `link.exe`（MSVC 的链接器）。Linux 上对应就是 GNU `ld`。
+
+### 什么时候会自动用 lld？
+
+| 场景 | 默认链接器 |
+|------|-----------|
+| **macOS** | `ld64`（Apple 链接器） |
+| **Windows（MSVC 模式）** | `link.exe` |
+| **Linux（绝大多数发行版）** | GNU `ld`（通过 `/usr/bin/ld`） |
+| **FreeBSD（部分版本）** | 可能默认 lld |
+| **交叉编译** | 取决于目标三元组，但通常仍回退到系统 `ld` |
+
+### 如何强制 Clang 用 lld？
+
+正如你之前做的，必须**显式指定**：
+
+```bash
+-fuse-ld=lld
+```
+
+或者在 CMake 中：
+
+```bash
+-DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld"
+```
+
+OpenJDK 等大型项目在自己的构建系统中也明确写了：*"We should use -fuse-ld=lld to force clang to always pick lld as the linker"*
+
+---
+
+### 总结
+
+| 组件 | Clang 默认行为（Linux） | 你的配置 |
+|------|------------------------|---------|
+| **编译器** | Clang-24 ✅ | Clang-24 ✅ |
+| **链接器** | GNU `ld`（系统默认） | `ld.lld`（通过 `-fuse-ld=lld` 强制）✅ |
+| **C++ 标准库** | `libstdc++`（GCC） | `libstdc++`（GCC）✅ |
+
+你的配置现在是**编译器用 Clang + 链接器用 lld + 标准库用 libstdc++**，这是 Linux 上性能最优的组合之一——lld 链接速度比 GNU ld 快 2 倍以上，而 libstdc++ 保证了与系统生态的兼容性。
+
+现在可以继续跑 benchmark 了，把输出贴给我。
+
+**************************************************************
+去除了
+  -DCMAKE_C_FLAGS="-g --gcc-toolchain=/usr" \
+  -DCMAKE_CXX_FLAGS="-g --gcc-toolchain=/usr" \
+  -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld -lstdc++" \
+
+后的
+"cmake .. \
+  -DCMAKE_BUILD_TYPE=Release \
+
+  -DCMAKE_C_COMPILER=/home/konglinglei/source/llvm-project-main/install/bin/clang-24 \
+  -DCMAKE_CXX_COMPILER=/home/konglinglei/source/llvm-project-main/install/bin/clang-24 \
+  -DCMAKE_POLICY_VERSION_MINIMUM=3.5",既然使用系统默认的连接器，为什么找不到系统默认的标准库？
+
+**核心原因在于：Clang 在 Linux 上的默认行为是“尊重系统默认链接器”，但“使用系统链接器”不等于“自动知道系统库在哪”，自编译的 Clang 缺失发行版预编译包的适配层，导致 GCC toolchain 路径探测失效。**
+
+### 底层机制拆解
+
+1. **Clang 不自带 C++ 标准库**
+   Clang 只是编译器前端，链接时依赖外部库（Linux 默认是 GCC 的 `libstdc++`）。 发行版预装的 `clang` 包经过打包适配，能自动探测系统 GCC 路径并注入 `-lstdc++` 等参数。
+
+2. **自编译 Clang 的探测机制失效**
+   你的 Clang-24 从源码编译，缺少适配层。Clang 内部通过扫描 `/usr/bin/../lib/gcc/...` 等硬编码相对路径来查找 GCC 工具链，自编译安装路径不匹配，导致探测失败。
+
+3. **链接器 ≠ 库搜索器**
+   链接器（`ld`/`ld.lld`）只负责合并 `.o` 文件和解析符号，**库的搜索路径由编译器驱动（clang++）决定**。Clang 找不到 GCC toolchain → 不会生成 `-L/usr/lib/gcc/... -lstdc++` → 链接器自然找不到库。
+
+### 为什么 `--gcc-toolchain=/usr` 能解决？
+
+该参数直接告诉 Clang："去 `/usr` 下找 GCC 的头文件、库和运行时"，等价于手动指定一堆 `-I` 和 `-L` 参数，绕过了失效的自动探测机制。
+
+### 总结
+
+| 场景 | 链接器 | 标准库 | 能否找到库 |
+|------|--------|--------|-----------|
+| 发行版预装 Clang | 系统 `ld` | `libstdc++` | ✅ 自动适配 |
+| 自编译 Clang（无参数） | 系统 `ld` | `libstdc++` | ❌ 探测失败 |
+| 自编译 Clang + `--gcc-toolchain` | 系统 `ld` | `libstdc++` | ✅ 显式指定 |
+| 自编译 Clang + `lld` + `-lstdc++` | `ld.lld` | `libstdc++` | ✅ 显式指定 |
+
+**关键点**：Clang 默认用系统链接器，但**不会自动帮你找系统库的路径**——这是两个独立的问题。
+
+---
+要不要现在跑一遍 `cmake --build . --target benchmarkLab`，确认当前配置下链接和性能都正常？
+********************************************************************************************************
+i
+
+
+如果把clang这个路径export的命令呢？
+
+
+1. 临时生效（当前 shell 会话，关闭终端就失效）
+bash
+export PATH=/home/konglinglei/source/llvm-project-main/install/bin:$PATH
+执行完立刻验证：
+bash
+clang++ --version
+此时调用的就是你自己编译的 llvm clang++，不再需要写完整路径。
+注意：$PATH 放后面，代表优先使用这个目录，覆盖系统自带 clang。
+
+
+clang++ -O3 -march=native -Wall \ -Rpass=loop-vectorize \ -Rpass-missed=loop-vectorize \ -Rpass-analysis=loop-vectorize \ -Rpass=slp-vectorize \ -Rpass-missed=slp-vectorize \ /home/konglinglei/source/AlgorithmicaHPC/chapter10/10.1.cpp -o 10.1 2> vec_report_clang.txt  使用这个命令编译，连接器是不是还是使用的Ubuntu系统路径gcc的连接器？
+
+
+
+验证方法（直接看 clang 实际调用的工具）
+bash
+clang++ -### -O3 -march=native 10.1.c -o 10.1
+-### 会打印完整编译、汇编、链接命令，不会真的编译。
+看输出里 ld 的路径：
+如果是 /usr/bin/ld → 系统 GNU ld（当前默认行为）
+如果是 /home/konglinglei/source/llvm-project-main/install/bin/ld.lld → LLVM lld
+*************************************************************************************************
