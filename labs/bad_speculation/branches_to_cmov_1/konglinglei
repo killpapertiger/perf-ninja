@@ -1122,3 +1122,45 @@ clang++ -### -O3 -march=native 10.1.c -o 10.1
 如果是 /usr/bin/ld → 系统 GNU ld（当前默认行为）
 如果是 /home/konglinglei/source/llvm-project-main/install/bin/ld.lld → LLVM lld
 *************************************************************************************************
+ttps://felix.abecassis.me/2012/08/sse-vectorizing-conditional-code/
+
+
+
+#include <cmath>
+
+void scalar(float* __restrict__ result,
+            const float* __restrict__ v,
+            unsigned length)
+{
+  for (unsigned i = 0; i < length; ++i)
+  {
+    float val = v[i];
+    if (val >= 0.f)
+      result[i] = std::sqrt(val);
+    else
+      result[i] = val;
+  }
+}
+
+这是向量化的无分支
+
+// 开平方，需要判断被开平方的数是否小于0
+void sse_sqrt(float* result, const float* v, const unsigned length) {
+  __m128 v_zeros = _mm_setzero_ps();
+  for (std::size_t i = 0; i + 4 < length; i += 4) {
+    __m128 v_v = _mm_load_ps(v + i);
+    __m128 ge_mask = _mm_cmpge_ps(v_v, v_zeros);
+    // 所有lane，无论是否为负数，都执行sqrt，如果是负数，对应lane的值为NAN。
+    // 你可以检测对应lane的值是否为NAN，也可以通过访问MXCSR寄存器获知是否有NAN值产生（但是不知道是哪个通道）
+    // 默认MXCSR寄存器的异常标志是静默。如果改成非静默，就有有异常抛出
+    __m128 v_sqrt_root = _mm_sqrt_ps(v_v);
+    // blend
+    __m128 res = _mm_or_ps(_mm_and_ps(ge_mask, v_sqrt_root), _mm_andnot_ps(ge_mask, v_v));
+    _mm_store_ps(result + i, res);
+    // result += 4;
+
+
+  }
+}
+这个是在rethinksimd目录中
+*************************************************************************************
